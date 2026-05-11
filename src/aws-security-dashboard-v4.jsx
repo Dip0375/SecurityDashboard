@@ -623,7 +623,7 @@ function PasswordStrengthMeter({ password }) {
 }
 
 // ─── Change Password Modal ────────────────────────────────────────────────────
-function ChangePasswordModal({ currentUser, onClose, credentials, setCredentials, addToast }) {
+function ChangePasswordModal({ currentUser, onClose, credentials, setCredentials, setCurrentUser, addToast }) {
   const [oldPass,   setOldPass]   = useState("");
   const [newPass,   setNewPass]   = useState("");
   const [confirm,   setConfirm]   = useState("");
@@ -646,8 +646,29 @@ function ChangePasswordModal({ currentUser, onClose, credentials, setCredentials
     setCredentials(prev => prev.map(c =>
       c.email === currentUser.email ? { ...c, password: newPass } : c
     ));
+    setCurrentUser(prev => prev ? { ...prev, password: newPass } : prev);
 
-    // Simulate email notification
+    fetch('/api/send-email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        to: cred.notifyEmail || cred.email,
+        subject: 'AWS SecureView Password Changed',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #00d4ff;">Your password was changed</h2>
+            <p>Hi ${currentUser.name || currentUser.email},</p>
+            <p>Your dashboard password was successfully updated.</p>
+            <p>If you did not make this change, contact your administrator immediately.</p>
+            <p>Best regards,<br/>AWS SecureView Team</p>
+          </div>
+        `,
+        text: `Your password was changed.\n\nIf you did not make this change, contact your administrator immediately.\n\nAWS SecureView Team\n`,
+      }),
+    }).catch(err => {
+      console.warn('Password email failed to send:', err);
+    });
+
     addToast(`Password changed. Confirmation sent to ${cred.notifyEmail || cred.email}`, "success");
     onClose();
   }
@@ -1254,7 +1275,7 @@ function SettingsSection({ currentUser, credentials, setCredentials, addToast })
 
       {showChangePwd && (
         <ChangePasswordModal currentUser={currentUser} onClose={()=>setShowChangePwd(false)}
-          credentials={credentials} setCredentials={setCredentials} addToast={addToast}/>
+          credentials={credentials} setCredentials={setCredentials} setCurrentUser={setCurrentUser} addToast={addToast}/>
       )}
       {showNotif && (
         <NotificationSettingsModal currentUser={currentUser} credentials={credentials}
@@ -1396,15 +1417,42 @@ function WAFSection({ account }) {
     );
   }
   const w = account.waf;
+  const webACLs = w?.webACLs || [];
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:18 }}>
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:12 }}>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(6,1fr)", gap:12 }}>
         <Stat label="Allow"     value={fmtNum(w.allow)}     color={C.green}  icon={CheckCircle}/>
         <Stat label="Block"     value={fmtNum(w.block)}     color={C.red}    icon={XCircle}/>
         <Stat label="Count"     value={fmtNum(w.count)}     color={C.yellow} icon={Activity}/>
         <Stat label="Challenge" value={fmtNum(w.challenge)} color={C.orange} icon={AlertTriangle}/>
         <Stat label="CAPTCHA"   value={fmtNum(w.captcha)}   color={C.purple} icon={Lock}/>
+        <Stat label="Web ACLs"  value={fmtNum(webACLs.length)} color={C.orange} icon={Shield}/>
       </div>
+      {webACLs.length > 0 && (
+        <div style={card()}>
+          <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 14px" }}>Web ACL Summary</h3>
+          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+            <thead>
+              <tr style={{ borderBottom:`1px solid ${C.border}` }}>
+                {['Name','Scope','Default Action','Rules'].map(h => (
+                  <th key={h} style={{ color:C.textSec, padding:"8px 12px", textAlign:"left", fontWeight:600, fontSize:11, textTransform:"uppercase", letterSpacing:"0.06em" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {webACLs.map((acl, idx) => (
+                <tr key={idx} style={{ borderBottom:`1px solid ${C.border}22` }}>
+                  <td style={{ padding:"10px 12px", color:C.textPri }}>{acl.name}</td>
+                  <td style={{ padding:"10px 12px", color:C.textSec }}>{acl.scope}</td>
+                  <td style={{ padding:"10px 12px", color:acl.defaultAction==="BLOCK"?C.red:C.green }}>{acl.defaultAction}</td>
+                  <td style={{ padding:"10px 12px", color:C.textSec }}>{acl.rules?.length ?? 0}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:18 }}>
         <div style={card()}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
@@ -2245,12 +2293,13 @@ function InventorySection({ account, refreshSignal, onInventoryLoaded }) {
       {data && (
         <>
           {/* Summary row */}
-          <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:12 }}>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(6,1fr)", gap:12 }}>
             <SummaryCard label="EC2 Instances" value={data.ec2.total} sub={`${data.ec2.running} running · ${data.ec2.stopped} stopped`} color={C.cyan}   Icon={Server}/>
             <SummaryCard label="EKS Clusters"  value={data.eks.total} sub={`${data.eks.clusters.reduce((a,c)=>a+(c.nodeCount||0),0)} total nodes`}         color={C.purple} Icon={Cpu}/>
             <SummaryCard label="S3 Buckets"    value={data.s3.total}  sub={`${data.s3.public} public · ${data.s3.private} private`}  color={data.s3.public>0?C.orange:C.green} Icon={Database}/>
             <SummaryCard label="VPCs"           value={data.vpc.total} sub={`${data.vpc.vpcs.reduce((a,v)=>a+v.subnets,0)} subnets total`}                  color={C.yellow} Icon={Network}/>
             <SummaryCard label="Load Balancers" value={data.alb.total} sub={`${data.alb.loadBalancers.filter(l=>l.scheme==="internet-facing").length} public · ${data.alb.loadBalancers.filter(l=>l.scheme==="internal").length} internal`} color={C.pink} Icon={GitBranch}/>
+            <SummaryCard label="Web ACLs"     value={data.waf.webACLs?.length ?? 0} sub={`${data.waf.webACLs?.filter(a=>a.scope==="CLOUDFRONT").length || 0} CDN · ${data.waf.webACLs?.filter(a=>a.scope!="CLOUDFRONT").length || 0} regional`} color={C.orange} Icon={Shield}/>
           </div>
 
           {/* EC2 table */}
@@ -2301,7 +2350,7 @@ function InventorySection({ account, refreshSignal, onInventoryLoaded }) {
 
           {/* ALB table */}
           <ResourceTable title="Application Load Balancers" Icon={GitBranch} color={C.pink} rows={data.alb.loadBalancers}
-            columns={[
+            columns={[ 
               { key:"name",    label:"Name",   render: r=><span style={{fontWeight:600,color:C.textPri}}>{r.name}</span> },
               { key:"scheme",  label:"Scheme", render: r=>(
                 <span style={{color:r.scheme==="internet-facing"?C.orange:C.cyan,fontWeight:700}}>
@@ -2310,6 +2359,15 @@ function InventorySection({ account, refreshSignal, onInventoryLoaded }) {
               )},
               { key:"state",   label:"State",  render: r=><span style={{color:r.state==="active"?C.green:C.yellow,fontWeight:700}}>{r.state}</span> },
               { key:"dns",     label:"DNS",    mono:true, color:()=>C.textSec },
+            ]}
+          />
+
+          <ResourceTable title="WAF Web ACLs" Icon={Shield} color={C.orange} rows={data.waf.webACLs || []}
+            columns={[
+              { key:"name", label:"Name", render: r=><span style={{fontWeight:600,color:C.textPri}}>{r.name}</span> },
+              { key:"scope", label:"Scope", render: r=><span style={{color:r.scope==="CLOUDFRONT"?C.purple:C.cyan,fontWeight:700}}>{r.scope}</span> },
+              { key:"defaultAction", label:"Default Action", render: r=><span style={{color:r.defaultAction==="BLOCK"?C.red:C.green,fontWeight:700}}>{r.defaultAction}</span> },
+              { key:"rules", label:"Rules", render: r=><span style={{color:C.textSec}}>{r.rules?.length ?? 0}</span> },
             ]}
           />
         </>
@@ -2523,7 +2581,8 @@ export default function App() {
           : [...prev, cred]
       );
       setUsers(prev => prev.map(u => u.email === cred.email ? { ...u, lastLogin:new Date().toISOString().replace("T"," ").slice(0,19) } : u));
-      setCurrentUser({ ...(credentials.find(u=>u.email===cred.email)||{}), ...cred });
+      const existingUser = credentials.find(u => u.email === cred.email) || users.find(u => u.email === cred.email) || {};
+      setCurrentUser({ ...existingUser, ...cred });
       setAuditLog(prev=>[{
         id:Date.now(), ts:new Date().toISOString().replace("T"," ").slice(0,19),
         user:cred.name||cred.email, email:cred.email, role:cred.role,
@@ -2556,7 +2615,7 @@ export default function App() {
 
       {showChangePwd && (
         <ChangePasswordModal currentUser={currentUser} onClose={()=>setShowChangePwd(false)}
-          credentials={credentials} setCredentials={setCredentials} addToast={addToast}/>
+          credentials={credentials} setCredentials={setCredentials} setCurrentUser={setCurrentUser} addToast={addToast}/>
       )}
       {showNotif && (
         <NotificationSettingsModal currentUser={currentUser} credentials={credentials}

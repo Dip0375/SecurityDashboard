@@ -379,11 +379,11 @@ export default async function handler(req, res) {
     const inspectorClient = new Inspector2Client(awsCreds);
 
     const [ec2, eks, s3, vpc, alb, waf, securityHub, guardDuty, inspector] = await Promise.all([
-      getEC2Inventory(ec2Client),
-      getEKSInventory(eksClient),
-      getS3Inventory(s3Client, region),
-      getVPCInventory(ec2Client),
-      getALBInventory(albClient),
+      safeCall("EC2", () => getEC2Inventory(ec2Client), { total:0, running:0, stopped:0, instances:[] }),
+      safeCall("EKS", () => getEKSInventory(eksClient), { total:0, clusters:[] }),
+      safeCall("S3", () => getS3Inventory(s3Client, region), { total:0, public:0, private:0, buckets:[] }),
+      safeCall("VPC", () => getVPCInventory(ec2Client), { total:0, vpcs:[] }),
+      safeCall("ALB", () => getALBInventory(albClient), { total:0, loadBalancers:[] }),
       safeCall("WAF", () => getWAFData(wafClient), { allow:0, block:0, count:0, challenge:0, captcha:0, configuredRules:0, webACLs:[], topGeoIPs:[], topURIs:[], blockedRules:[] }),
       safeCall("Security Hub", () => getSecurityHubData(securityHubClient), { score:0, critical:0, high:0, medium:0, low:0, trend:[], findings:[] }),
       safeCall("GuardDuty", () => getGuardDutyData(guardDutyClient), { findings:0, high:0, medium:0, low:0, types:[] }),

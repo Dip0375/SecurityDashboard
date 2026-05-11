@@ -98,6 +98,32 @@ function buildMockInventory(accountId) {
         targets:  rng(2, 8),
       })),
     },
+    waf: {
+      allow:     rng(5, 20),
+      block:     rng(2, 15),
+      count:     rng(1, 8),
+      challenge: rng(0, 4),
+      captcha:   rng(0, 2),
+      configuredRules: rng(10, 32),
+      webACLs: [
+        { name: `global-acl-${seed % 3 + 1}`, scope: "CLOUDFRONT", defaultAction: "BLOCK", rules: [{ name: "SQLInjection", action: "BLOCK" }, { name: "XSS", action: "BLOCK" }] },
+        { name: `regional-acl-${seed % 4 + 1}`, scope: "REGIONAL", defaultAction: "ALLOW", rules: [{ name: "RateLimit", action: "COUNT" }] },
+      ],
+      topGeoIPs: [
+        { country: "China", requests: rng(300, 1200) },
+        { country: "Russia", requests: rng(180, 920) },
+        { country: "Nigeria", requests: rng(140, 780) },
+      ],
+      topURIs: [
+        { uri: "/api/login", requests: rng(260, 650) },
+        { uri: "/admin", requests: rng(180, 490) },
+        { uri: "/checkout", requests: rng(120, 360) },
+      ],
+      blockedRules: [
+        { rule: "SQLInjection", blocks: rng(60, 160) },
+        { rule: "XSS", blocks: rng(30, 90) },
+      ],
+    },
     fetchedAt: new Date().toISOString(),
   };
 }
@@ -110,8 +136,13 @@ async function fetchFromAPI(accountId, region, credential) {
     body: JSON.stringify({ accountId, region, service: "inventory", credential }),
   });
   if (!res.ok) {
-    const err = await res.text().catch(() => res.statusText);
-    throw new Error(`AWS query failed: ${err}`);
+    const body = await res.text().catch(() => res.statusText);
+    let message = body;
+    try {
+      const parsed = JSON.parse(body);
+      message = parsed.error || parsed.message || body;
+    } catch {}
+    throw new Error(`AWS query failed: ${message}`);
   }
   return res.json();
 }
