@@ -322,7 +322,11 @@ function accountFromInventory(account, inventory) {
     ...account,
     inventory,
     lastInventorySync: inventory?.fetchedAt || new Date().toISOString(),
-    securityHub: {
+    securityHub: inventory?.securityHub ? {
+      ...account.securityHub,
+      ...inventory.securityHub,
+      trend: inventory.securityHub.trend?.length ? inventory.securityHub.trend : account.securityHub.trend || [],
+    } : {
       ...account.securityHub,
       score,
       critical: publicS3,
@@ -331,7 +335,10 @@ function accountFromInventory(account, inventory) {
       low: Math.max(0, totalResources - exposure - stoppedEc2),
       trend: account.securityHub.trend || [],
     },
-    guardDuty: {
+    guardDuty: inventory?.guardDuty ? {
+      ...account.guardDuty,
+      ...inventory.guardDuty,
+    } : {
       ...account.guardDuty,
       findings: exposure,
       high: publicS3,
@@ -342,7 +349,10 @@ function accountFromInventory(account, inventory) {
         ...(publicAlb ? [{ type:"Recon/PublicLoadBalancerExposure", count:publicAlb, severity:"medium" }] : []),
       ],
     },
-    inspector: {
+    inspector: inventory?.inspector ? {
+      ...account.inspector,
+      ...inventory.inspector,
+    } : {
       ...account.inspector,
       score: Math.max(40, 100 - stoppedEc2 * 5),
       critical: 0,
@@ -353,7 +363,13 @@ function accountFromInventory(account, inventory) {
         .filter(i => i.state !== "running")
         .map(i => ({ resource:i.id, type:"Stopped EC2 instance", severity:"high" })),
     },
-    waf: {
+    waf: inventory?.waf ? {
+      ...account.waf,
+      ...inventory.waf,
+      topGeoIPs: inventory.waf.topGeoIPs?.length ? inventory.waf.topGeoIPs : account.waf.topGeoIPs || [],
+      topURIs: inventory.waf.topURIs?.length ? inventory.waf.topURIs : account.waf.topURIs || [],
+      blockedRules: inventory.waf.blockedRules?.length ? inventory.waf.blockedRules : account.waf.blockedRules || [],
+    } : {
       ...account.waf,
       allow: totalResources,
       block: exposure,
@@ -1431,6 +1447,7 @@ function WAFSection({ account }) {
       </div>
       <div style={card()}>
         <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 14px" }}>Blocked Rules Breakdown</h3>
+        {w.error && <p style={{ color:C.orange, fontSize:12, margin:"0 0 10px" }}>{w.error}</p>}
         <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
           <thead>
             <tr style={{ borderBottom:`1px solid ${C.border}` }}>
@@ -1441,7 +1458,9 @@ function WAFSection({ account }) {
             </tr>
           </thead>
           <tbody>
-            {w.blockedRules.map((r,i)=>{
+            {w.blockedRules.length === 0 ? (
+              <tr><td colSpan={3} style={{ padding:24, color:C.textSec, textAlign:"center" }}>No WAF WebACL rules found</td></tr>
+            ) : w.blockedRules.map((r,i)=>{
               const total = w.blockedRules.reduce((a,x)=>a+x.blocks,0)||1;
               const pct = Math.round((r.blocks/total)*100);
               return (
@@ -1477,7 +1496,9 @@ function SecurityHubSection({ account }) {
     );
   }
   const sh = account.securityHub;
-  const trendData = sh.trend.map((v,i)=>({ day:`D-${sh.trend.length-i}`, score:v }));
+  const trendData = sh.trend?.length
+    ? sh.trend.map((v,i)=>({ day:`D-${sh.trend.length-i}`, score:v }))
+    : [{ day:"Current", score:Math.round(sh.score || 0) }];
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:18 }}>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 2fr", gap:18 }}>
@@ -1516,6 +1537,7 @@ function SecurityHubSection({ account }) {
         </div>
       </div>
       <div style={card()}>
+        {sh.error && <p style={{ color:C.orange, fontSize:12, margin:"0 0 10px" }}>{sh.error}</p>}
         <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 4px" }}>Severity Distribution</h3>
         <p style={{ color:C.textSec, fontSize:12, margin:"0 0 14px" }}>Breakdown of all active findings</p>
         <SevBar critical={sh.critical} high={sh.high} medium={sh.medium} low={sh.low}/>
@@ -1545,8 +1567,11 @@ function GuardDutySection({ account }) {
       </div>
       <div style={card()}>
         <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 16px" }}>Active Threat Findings</h3>
+        {gd.error && <p style={{ color:C.orange, fontSize:12, margin:"0 0 10px" }}>{gd.error}</p>}
         <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
-          {gd.types.map((t,i)=>(
+          {gd.types.length === 0 ? (
+            <div style={{ color:C.textSec, fontSize:12, textAlign:"center", padding:24 }}>No active GuardDuty findings found</div>
+          ) : gd.types.map((t,i)=>(
             <div key={i} style={{ ...card2(), display:"flex", alignItems:"center", gap:14,
               borderLeft:`3px solid ${sevColor(t.severity)}` }}>
               <div style={{ width:40, height:40, borderRadius:10, background:sevBg(t.severity),
@@ -1601,6 +1626,7 @@ function InspectorSection({ account }) {
       </div>
       <div style={card()}>
         <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 14px" }}>Critical & High Findings</h3>
+        {ins.error && <p style={{ color:C.orange, fontSize:12, margin:"0 0 10px" }}>{ins.error}</p>}
         <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
           <thead>
             <tr style={{ borderBottom:`1px solid ${C.border}` }}>
@@ -1611,7 +1637,9 @@ function InspectorSection({ account }) {
             </tr>
           </thead>
           <tbody>
-            {ins.findings.map((f,i)=>(
+            {ins.findings.length === 0 ? (
+              <tr><td colSpan={3} style={{ padding:24, color:C.textSec, textAlign:"center" }}>No active Inspector findings found</td></tr>
+            ) : ins.findings.map((f,i)=>(
               <tr key={i} style={{ borderBottom:`1px solid ${C.border}44` }}>
                 <td style={{ padding:"10px 14px", color:C.cyan, fontFamily:"monospace", fontSize:12 }}>{f.resource}</td>
                 <td style={{ padding:"10px 14px", color:C.textPri, fontFamily:"monospace", fontSize:12 }}>{f.type}</td>

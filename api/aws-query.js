@@ -47,6 +47,25 @@ import {
   DescribeLoadBalancersCommand,
   DescribeTargetGroupsCommand,
 } from "@aws-sdk/client-elastic-load-balancing-v2";
+import {
+  WAFV2Client,
+  ListWebACLsCommand,
+  GetWebACLCommand,
+} from "@aws-sdk/client-wafv2";
+import {
+  SecurityHubClient,
+  GetFindingsCommand,
+} from "@aws-sdk/client-securityhub";
+import {
+  GuardDutyClient,
+  ListDetectorsCommand,
+  ListFindingsCommand,
+  GetFindingsCommand as GetGuardDutyFindingsCommand,
+} from "@aws-sdk/client-guardduty";
+import {
+  Inspector2Client,
+  ListFindingsCommand as ListInspectorFindingsCommand,
+} from "@aws-sdk/client-inspector2";
 
 // ─── Resolve credentials from environment ────────────────────────────────────
 function resolveCredentials(accountId, requestCredential) {
@@ -175,6 +194,156 @@ async function getALBInventory(client) {
   return { total: loadBalancers.length, loadBalancers };
 }
 
+function emptySeverity() {
+  return { critical: 0, high: 0, medium: 0, low: 0 };
+}
+
+function severityKey(value) {
+  const sev = String(value || "").toLowerCase();
+  if (sev === "informational") return "low";
+  return ["critical", "high", "medium", "low"].includes(sev) ? sev : "low";
+}
+
+async function safeCall(label, fn, fallback) {
+  try {
+    return await fn();
+  } catch (err) {
+    console.warn(`[aws-query] ${label} unavailable:`, err.name || err.message);
+    return { ...fallback, error: err.message };
+  }
+}
+
+async function getWAFData(client) {
+  const scopes = ["REGIONAL", "CLOUDFRONT"];
+  const webACLs = [];
+
+  for (const scope of scopes) {
+    try {
+      const res = await client.send(new ListWebACLsCommand({ Scope: scope, Limit: 100 }));
+      for (const acl of res.WebACLs || []) {
+        let detail = null;
+        try {
+          const full = await client.send(new GetWebACLCommand({ Scope: scope, Name: acl.Name, Id: acl.Id }));
+          detail = full.WebACL;
+        } catch { /* list data is still useful */ }
+        webACLs.push({
+          name: acl.Name,
+          id: acl.Id,
+          scope,
+          arn: acl.ARN,
+          defaultAction: detail?.DefaultAction?.Allow ? "ALLOW" : detail?.DefaultAction?.Block ? "BLOCK" : "UNKNOWN",
+          rules: (detail?.Rules || []).map(r => ({
+            name: r.Name,
+            priority: r.Priority,
+            action: r.Action?.Allow ? "ALLOW" : r.Action?.Block ? "BLOCK" : r.Action?.Count ? "COUNT" : "MANAGED",
+          })),
+        });
+      }
+    } catch { /* scope may be unavailable in this region */ }
+  }
+
+  const rules = webACLs.flatMap(acl => acl.rules.map(rule => ({ ...rule, webAcl: acl.name, blocks: rule.action === "BLOCK" ? 1 : 0 })));
+  return {
+    allow: webACLs.filter(a => a.defaultAction === "ALLOW").length,
+    block: rules.filter(r => r.action === "BLOCK").length,
+    count: rules.filter(r => r.action === "COUNT").length,
+    challenge: rules.filter(r => r.action === "MANAGED").length,
+    captcha: 0,
+    configuredRules: rules.length,
+    webACLs,
+    topGeoIPs: [],
+    topURIs: [],
+    blockedRules: rules.slice(0, 10).map(r => ({ rule: `${r.webAcl}/${r.name}`, blocks: Math.max(1, r.blocks) })),
+  };
+}
+
+async function getSecurityHubData(client) {
+  const findings = [];
+  let nextToken;
+  do {
+    const res = await client.send(new GetFindingsCommand({
+      MaxResults: 100,
+      NextToken: nextToken,
+      Filters: {
+        RecordState: [{ Value: "ACTIVE", Comparison: "EQUALS" }],
+        WorkflowStatus: [{ Value: "RESOLVED", Comparison: "NOT_EQUALS" }],
+      },
+    }));
+    findings.push(...(res.Findings || []));
+    nextToken = res.NextToken;
+  } while (nextToken && findings.length < 300);
+
+  const counts = emptySeverity();
+  findings.forEach(f => counts[severityKey(f.Severity?.Label)]++);
+  const weighted = counts.critical * 12 + counts.high * 6 + counts.medium * 3 + counts.low;
+  return {
+    score: Math.max(0, 100 - weighted),
+    ...counts,
+    trend: [],
+    findings: findings.slice(0, 25).map(f => ({
+      title: f.Title,
+      resource: f.Resources?.[0]?.Id || "-",
+      severity: severityKey(f.Severity?.Label),
+      compliance: f.Compliance?.Status || "-",
+    })),
+  };
+}
+
+async function getGuardDutyData(client) {
+  const detectors = (await client.send(new ListDetectorsCommand({}))).DetectorIds || [];
+  const allFindings = [];
+  for (const detectorId of detectors) {
+    const listed = await client.send(new ListFindingsCommand({
+      DetectorId: detectorId,
+      MaxResults: 50,
+      FindingCriteria: { Criterion: { serviceArchived: { Eq: ["false"] } } },
+    }));
+    const ids = listed.FindingIds || [];
+    if (ids.length) {
+      const res = await client.send(new GetGuardDutyFindingsCommand({ DetectorId: detectorId, FindingIds: ids }));
+      allFindings.push(...(res.Findings || []));
+    }
+  }
+  const high = allFindings.filter(f => f.Severity >= 7).length;
+  const medium = allFindings.filter(f => f.Severity >= 4 && f.Severity < 7).length;
+  const low = allFindings.filter(f => f.Severity < 4).length;
+  const byType = new Map();
+  allFindings.forEach(f => {
+    const severity = f.Severity >= 7 ? "high" : f.Severity >= 4 ? "medium" : "low";
+    const current = byType.get(f.Type) || { type: f.Type, count: 0, severity };
+    current.count++;
+    byType.set(f.Type, current);
+  });
+  return { findings: allFindings.length, high, medium, low, types: Array.from(byType.values()).slice(0, 20) };
+}
+
+async function getInspectorData(client) {
+  const findings = [];
+  let nextToken;
+  do {
+    const res = await client.send(new ListInspectorFindingsCommand({
+      maxResults: 100,
+      nextToken,
+      filterCriteria: { findingStatus: [{ comparison: "EQUALS", value: "ACTIVE" }] },
+    }));
+    findings.push(...(res.findings || []));
+    nextToken = res.nextToken;
+  } while (nextToken && findings.length < 300);
+
+  const counts = emptySeverity();
+  findings.forEach(f => counts[severityKey(f.severity)]++);
+  const weighted = counts.critical * 10 + counts.high * 5 + counts.medium * 2 + counts.low;
+  return {
+    score: Math.max(0, 100 - weighted),
+    ...counts,
+    findings: findings.slice(0, 25).map(f => ({
+      resource: f.resources?.[0]?.id || "-",
+      type: f.title || f.type || "-",
+      severity: severityKey(f.severity),
+    })),
+  };
+}
+
 // ─── Handler ──────────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
   // CORS – allow only your own domain in production
@@ -204,16 +373,24 @@ export default async function handler(req, res) {
     const eksClient = new EKSClient(awsCreds);
     const s3Client  = new S3Client({ ...awsCreds, region: "us-east-1" }); // S3 is global
     const albClient = new ElasticLoadBalancingV2Client(awsCreds);
+    const wafClient = new WAFV2Client(awsCreds);
+    const securityHubClient = new SecurityHubClient(awsCreds);
+    const guardDutyClient = new GuardDutyClient(awsCreds);
+    const inspectorClient = new Inspector2Client(awsCreds);
 
-    const [ec2, eks, s3, vpc, alb] = await Promise.all([
+    const [ec2, eks, s3, vpc, alb, waf, securityHub, guardDuty, inspector] = await Promise.all([
       getEC2Inventory(ec2Client),
       getEKSInventory(eksClient),
       getS3Inventory(s3Client, region),
       getVPCInventory(ec2Client),
       getALBInventory(albClient),
+      safeCall("WAF", () => getWAFData(wafClient), { allow:0, block:0, count:0, challenge:0, captcha:0, configuredRules:0, webACLs:[], topGeoIPs:[], topURIs:[], blockedRules:[] }),
+      safeCall("Security Hub", () => getSecurityHubData(securityHubClient), { score:0, critical:0, high:0, medium:0, low:0, trend:[], findings:[] }),
+      safeCall("GuardDuty", () => getGuardDutyData(guardDutyClient), { findings:0, high:0, medium:0, low:0, types:[] }),
+      safeCall("Inspector", () => getInspectorData(inspectorClient), { score:0, critical:0, high:0, medium:0, low:0, findings:[] }),
     ]);
 
-    return res.status(200).json({ ec2, eks, s3, vpc, alb, fetchedAt: new Date().toISOString() });
+    return res.status(200).json({ ec2, eks, s3, vpc, alb, waf, securityHub, guardDuty, inspector, fetchedAt: new Date().toISOString() });
   } catch (err) {
     console.error("[aws-query] Error:", err);
     return res.status(500).json({ error: err.message });
