@@ -49,8 +49,16 @@ import {
 } from "@aws-sdk/client-elastic-load-balancing-v2";
 
 // ─── Resolve credentials from environment ────────────────────────────────────
-function resolveCredentials(accountId) {
+function resolveCredentials(accountId, requestCredential) {
   const safe = accountId.replace(/\D/g, ""); // digits only
+  if (requestCredential?.accessKeyId && requestCredential?.secretAccessKey) {
+    return {
+      accessKeyId: requestCredential.accessKeyId,
+      secretAccessKey: requestCredential.secretAccessKey,
+      region: requestCredential.region || "us-east-1",
+    };
+  }
+
   const accessKeyId     = process.env[`AWS_ACCOUNT_${safe}_ACCESS_KEY_ID`];
   const secretAccessKey = process.env[`AWS_ACCOUNT_${safe}_SECRET_ACCESS_KEY`];
   const region          = process.env[`AWS_ACCOUNT_${safe}_REGION`] || "us-east-1";
@@ -176,10 +184,10 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  const { accountId, region: requestedRegion, service } = req.body || {};
+  const { accountId, region: requestedRegion, credential } = req.body || {};
   if (!accountId) return res.status(400).json({ error: "accountId is required" });
 
-  const creds = resolveCredentials(accountId);
+  const creds = resolveCredentials(accountId, credential);
   if (!creds) {
     return res.status(404).json({
       error: `No credentials configured server-side for account ${accountId}. ` +

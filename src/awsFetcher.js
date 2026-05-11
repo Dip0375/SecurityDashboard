@@ -1,3 +1,5 @@
+import { getCredential } from "./credentialStore.js";
+
 /**
  * awsFetcher.js
  * ──────────────────────────────────────────────────────────────────────────────
@@ -101,13 +103,11 @@ function buildMockInventory(accountId) {
 }
 
 // ─── Real API call (Vercel serverless route) ──────────────────────────────────
-async function fetchFromAPI(accountId, region) {
+async function fetchFromAPI(accountId, region, credential) {
   const res = await fetch("/api/aws-query", {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
-    // NOTE: we only send accountId, NOT the keys.
-    // The serverless function resolves the keys from its secure store.
-    body: JSON.stringify({ accountId, region, service: "inventory" }),
+    body: JSON.stringify({ accountId, region, service: "inventory", credential }),
   });
   if (!res.ok) {
     const err = await res.text().catch(() => res.statusText);
@@ -128,10 +128,11 @@ async function fetchFromAPI(accountId, region) {
  * @returns {Promise<InventoryData>}
  */
 export async function fetchInventory(accountId, region) {
-  if (MOCK) {
+  const credential = getCredential(accountId);
+  if (MOCK && !credential) {
     // Simulate network latency
     await new Promise((r) => setTimeout(r, 600 + Math.random() * 800));
     return buildMockInventory(accountId);
   }
-  return fetchFromAPI(accountId, region);
+  return fetchFromAPI(accountId, region, credential);
 }

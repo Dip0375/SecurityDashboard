@@ -305,6 +305,72 @@ function usePersistentState(key, fallback) {
   return [value, setValue];
 }
 
+function accountFromInventory(account, inventory) {
+  const publicS3 = inventory?.s3?.public || 0;
+  const publicAlb = (inventory?.alb?.loadBalancers || []).filter(lb => lb.scheme === "internet-facing").length;
+  const stoppedEc2 = inventory?.ec2?.stopped || 0;
+  const totalResources =
+    (inventory?.ec2?.total || 0) +
+    (inventory?.eks?.total || 0) +
+    (inventory?.s3?.total || 0) +
+    (inventory?.vpc?.total || 0) +
+    (inventory?.alb?.total || 0);
+  const exposure = publicS3 + publicAlb;
+  const score = Math.max(35, 100 - publicS3 * 12 - publicAlb * 4 - stoppedEc2 * 2);
+
+  return {
+    ...account,
+    inventory,
+    lastInventorySync: inventory?.fetchedAt || new Date().toISOString(),
+    securityHub: {
+      ...account.securityHub,
+      score,
+      critical: publicS3,
+      high: publicAlb,
+      medium: stoppedEc2,
+      low: Math.max(0, totalResources - exposure - stoppedEc2),
+      trend: account.securityHub.trend || [],
+    },
+    guardDuty: {
+      ...account.guardDuty,
+      findings: exposure,
+      high: publicS3,
+      medium: publicAlb,
+      low: 0,
+      types: [
+        ...(publicS3 ? [{ type:"S3/BucketPublicAccess", count:publicS3, severity:"high" }] : []),
+        ...(publicAlb ? [{ type:"Recon/PublicLoadBalancerExposure", count:publicAlb, severity:"medium" }] : []),
+      ],
+    },
+    inspector: {
+      ...account.inspector,
+      score: Math.max(40, 100 - stoppedEc2 * 5),
+      critical: 0,
+      high: stoppedEc2,
+      medium: 0,
+      low: 0,
+      findings: (inventory?.ec2?.instances || [])
+        .filter(i => i.state !== "running")
+        .map(i => ({ resource:i.id, type:"Stopped EC2 instance", severity:"high" })),
+    },
+    waf: {
+      ...account.waf,
+      allow: totalResources,
+      block: exposure,
+      count: stoppedEc2,
+      challenge: publicAlb,
+      captcha: publicS3,
+      configuredRules: totalResources,
+      topGeoIPs: [],
+      topURIs: (inventory?.s3?.buckets || []).slice(0, 5).map(b => ({ uri:b.name, requests:b.isPublic ? 1 : 0 })),
+      blockedRules: [
+        ...(publicS3 ? [{ rule:"Public S3 Buckets", blocks:publicS3 }] : []),
+        ...(publicAlb ? [{ rule:"Public Load Balancers", blocks:publicAlb }] : []),
+      ],
+    },
+  };
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function calcRisk(acc) {
   if (!acc) return 0;
@@ -1184,12 +1250,17 @@ function SettingsSection({ currentUser, credentials, setCredentials, addToast })
 
 // ─── Overview ─────────────────────────────────────────────────────────────────
 function OverviewSection({ accounts, setActive, setSelected }) {
+  const hasInventory = accounts.some(a => a.inventory);
   const totals = accounts.reduce((acc,a)=>({
     critical:acc.critical+a.securityHub.critical+a.inspector.critical,
     high:acc.high+a.securityHub.high+a.inspector.high,
     gdFindings:acc.gdFindings+a.guardDuty.findings,
     wafBlocked:acc.wafBlocked+a.waf.block,
-  }),{critical:0,high:0,gdFindings:0,wafBlocked:0});
+    ec2:acc.ec2+(a.inventory?.ec2?.total || 0),
+    s3:acc.s3+(a.inventory?.s3?.total || 0),
+    vpc:acc.vpc+(a.inventory?.vpc?.total || 0),
+    publicS3:acc.publicS3+(a.inventory?.s3?.public || 0),
+  }),{critical:0,high:0,gdFindings:0,wafBlocked:0,ec2:0,s3:0,vpc:0,publicS3:0});
 
   if (accounts.length === 0) {
     return (
@@ -1216,10 +1287,21 @@ function OverviewSection({ accounts, setActive, setSelected }) {
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
       <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:14 }}>
-        <Stat label="Total Critical" value={totals.critical} color={C.red}    icon={XCircle}       sub="Across all accounts"/>
-        <Stat label="Total High"     value={totals.high}     color={C.orange}  icon={AlertTriangle} sub="Across all accounts"/>
-        <Stat label="GD Findings"    value={totals.gdFindings} color={C.yellow} icon={ShieldAlert}  sub="GuardDuty"/>
-        <Stat label="WAF Blocks"     value={fmtNum(totals.wafBlocked)} color={C.cyan} icon={Shield} sub="Total blocked requests"/>
+        {hasInventory ? (
+          <>
+            <Stat label="EC2 Instances" value={totals.ec2} color={C.cyan} icon={Server} sub="Live AWS inventory"/>
+            <Stat label="S3 Buckets" value={totals.s3} color={totals.publicS3?C.orange:C.green} icon={Database} sub={`${totals.publicS3} public`}/>
+            <Stat label="VPCs" value={totals.vpc} color={C.yellow} icon={Network} sub="Across accounts"/>
+            <Stat label="Exposure" value={totals.high + totals.critical} color={(totals.high + totals.critical)?C.red:C.green} icon={ShieldAlert} sub="Public resources found"/>
+          </>
+        ) : (
+          <>
+            <Stat label="Total Critical" value={totals.critical} color={C.red}    icon={XCircle}       sub="Across all accounts"/>
+            <Stat label="Total High"     value={totals.high}     color={C.orange}  icon={AlertTriangle} sub="Across all accounts"/>
+            <Stat label="GD Findings"    value={totals.gdFindings} color={C.yellow} icon={ShieldAlert}  sub="GuardDuty"/>
+            <Stat label="WAF Blocks"     value={fmtNum(totals.wafBlocked)} color={C.cyan} icon={Shield} sub="Total blocked requests"/>
+          </>
+        )}
       </div>
 
       <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:16 }}>
@@ -1238,12 +1320,17 @@ function OverviewSection({ accounts, setActive, setSelected }) {
                 <ScoreRing score={risk} size={72} label="Risk" />
               </div>
               <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
-                {[
+                {(acc.inventory ? [
+                  {l:"EC2",v:acc.inventory.ec2.total,c:C.cyan},
+                  {l:"S3 Buckets",v:acc.inventory.s3.total,c:acc.inventory.s3.public?C.orange:C.green},
+                  {l:"VPCs",v:acc.inventory.vpc.total,c:C.yellow},
+                  {l:"ALBs",v:acc.inventory.alb.total,c:C.pink},
+                ] : [
                   {l:"SecHub Score",v:`${acc.securityHub.score}`,c:riskColor(acc.securityHub.score)},
                   {l:"Inspector Score",v:`${acc.inspector.score}`,c:riskColor(acc.inspector.score)},
                   {l:"GD Findings",v:acc.guardDuty.findings,c:acc.guardDuty.high>0?C.orange:C.yellow},
                   {l:"WAF Blocks",v:fmtNum(acc.waf.block),c:C.cyan},
-                ].map(x=>(
+                ]).map(x=>(
                   <div key={x.l} style={{ background:C.card2, borderRadius:8, padding:"9px 11px" }}>
                     <div style={{ color:C.textSec, fontSize:10, textTransform:"uppercase", letterSpacing:"0.06em" }}>{x.l}</div>
                     <div style={{ color:x.c, fontSize:17, fontWeight:800, marginTop:2 }}>{x.v}</div>
@@ -1831,7 +1918,15 @@ function AccountsSection({ accounts, setAccounts, addToast, logEvent }) {
         secretAccessKey: form.secretKey,
         region:          form.region,
       });
-      setAccounts(prev=>[...prev,{ ...ACCOUNT_TEMPLATE, id:form.id, name:form.name, region:form.region }]);
+      const baseAccount = { ...ACCOUNT_TEMPLATE, id:form.id, name:form.name, region:form.region };
+      let nextAccount = baseAccount;
+      try {
+        const inventory = await fetchInventory(form.id, form.region);
+        nextAccount = accountFromInventory(baseAccount, inventory);
+      } catch (fetchErr) {
+        addToast(`Account saved, but live AWS fetch failed: ${fetchErr.message}`, "warning");
+      }
+      setAccounts(prev=>[...prev,nextAccount]);
       logEvent("account_add", `Onboarded AWS account ${form.name} (${form.id}) in ${form.region}`, "success");
       addToast(`Account "${form.name}" onboarded — credentials encrypted & saved`, "success");
       setForm({ id:"", name:"", region:"us-east-1", accessKey:"", secretKey:"" });
@@ -1988,7 +2083,7 @@ function AccountsSection({ accounts, setAccounts, addToast, logEvent }) {
 }
 
 // ─── Inventory Section ────────────────────────────────────────────────────────
-function InventorySection({ account, refreshSignal }) {
+function InventorySection({ account, refreshSignal, onInventoryLoaded }) {
   const [data,    setData]    = useState(null);
   const [loading, setLoading] = useState(false);
   const [error,   setError]   = useState(null);
@@ -2008,6 +2103,7 @@ function InventorySection({ account, refreshSignal }) {
     try {
       const inv = await fetchInventory(account.id, account.region);
       setData(inv);
+      onInventoryLoaded?.(account.id, inv);
       setLastFetched(new Date());
     } catch(e) {
       setError(e.message);
@@ -2382,6 +2478,13 @@ export default function App() {
     setTimeout(() => setRefreshingPage(false), 800);
   }
 
+  function handleInventoryLoaded(accountId, inventory) {
+    setAccounts(prev => prev.map(acc =>
+      acc.id === accountId ? accountFromInventory(acc, inventory) : acc
+    ));
+    logEvent("view_section", `Fetched live AWS inventory for account ${accountId}`, "success");
+  }
+
   if (!currentUser) {
     return <LoginScreen onLogin={async cred=>{
       // ── init the credential store with the user's session passphrase ──
@@ -2459,7 +2562,7 @@ export default function App() {
           />
           <div key={`${section}-${refreshSignal}`} style={{ flex:1, padding:22, overflowY:"auto" }}>
             {section==="overview"    && <OverviewSection accounts={scaledAccounts} setActive={setSection} setSelected={setSelectedAcc}/>}
-            {section==="inventory"   && <InventorySection account={account} refreshSignal={refreshSignal}/>}
+            {section==="inventory"   && <InventorySection account={account} refreshSignal={refreshSignal} onInventoryLoaded={handleInventoryLoaded}/>}
             {section==="waf"         && <WAFSection account={account}/>}
             {section==="securityhub" && <SecurityHubSection account={account}/>}
             {section==="guardduty"   && <GuardDutySection account={account}/>}
