@@ -81,7 +81,7 @@ In **Vercel Dashboard → Your Project → Settings → Environment Variables**,
 
 ```
 # Dashboard login (not AWS keys)
-VITE_DEFAULT_CREDENTIALS  = [{"email":"admin@you.com","password":"...","role":"admin","name":"Admin"}]
+DASHBOARD_CREDENTIALS     = [{"email":"admin@you.com","password":"...","role":"admin","name":"Admin"}]
 VITE_MOCK_AWS             = false     ← disable mock mode in production
 
 # Per AWS account (repeat for each account)

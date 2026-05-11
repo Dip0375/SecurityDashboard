@@ -245,23 +245,41 @@ const ACCOUNT_TEMPLATE = {
 const INIT_USERS = [];
 
 // ─── Initial Credentials (cleared — credentials should be provisioned securely) ──
-const DEFAULT_CREDENTIALS = [];
-
 function getEnvironmentCredentials() {
   const raw = import.meta.env.VITE_DEFAULT_CREDENTIALS;
-  console.log("VITE_DEFAULT_CREDENTIALS raw value:", raw);
   if (!raw) {
-    console.warn("No VITE_DEFAULT_CREDENTIALS found in environment");
     return [];
   }
   try {
-    const parsed = JSON.parse(raw);
-    console.log("Parsed credentials:", parsed);
+    const trimmed = raw.trim();
+    const normalized =
+      ((trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+       (trimmed.startsWith('"') && trimmed.endsWith('"')))
+        ? trimmed.slice(1, -1)
+        : trimmed;
+    const parsed = JSON.parse(normalized);
     return Array.isArray(parsed) ? parsed : [];
   } catch (err) {
-    console.error("Failed to parse VITE_DEFAULT_CREDENTIALS:", err, "Raw value:", raw);
+    console.error("Failed to parse VITE_DEFAULT_CREDENTIALS:", err);
     return [];
   }
+}
+
+async function loginWithServer(email, password) {
+  const res = await fetch("/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const payload = await res.json().catch(() => ({}));
+    throw new Error(payload.error || "Invalid email or password.");
+  }
+
+  const payload = await res.json();
+  return { ...payload.user, password };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -780,13 +798,24 @@ function LoginScreen({ onLogin, credentials }) {
   const [show,  setShow]    = useState(false);
   const [loading, setLoading] = useState(false);
 
-  function attempt() {
-    const found = credentials.find(c=>c.email===email&&c.password===pass);
-    if (found) {
-      setLoading(true);
-      setTimeout(()=>{ onLogin(found); setErr(""); }, 600);
-    } else {
-      setErr("Invalid email or password.");
+  async function attempt() {
+    setErr("");
+    setLoading(true);
+    try {
+      const serverUser = await loginWithServer(email, pass);
+      const found = serverUser || credentials.find(c=>c.email===email&&c.password===pass);
+      if (found) {
+        await onLogin(found);
+        setErr("");
+      } else {
+        setErr(credentials.length
+          ? "Invalid email or password."
+          : "No login credentials are configured for this deployment.");
+      }
+    } catch (err) {
+      setErr(err.message || "Invalid email or password.");
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -2297,6 +2326,11 @@ export default function App() {
     return <LoginScreen onLogin={async cred=>{
       // ── init the credential store with the user's session passphrase ──
       await initStore(cred.email + ":" + cred.password);
+      setCredentials(prev =>
+        prev.some(u => u.email === cred.email)
+          ? prev.map(u => u.email === cred.email ? { ...u, ...cred } : u)
+          : [...prev, cred]
+      );
       setCurrentUser({ ...(credentials.find(u=>u.email===cred.email)||{}), ...cred });
       setAuditLog(prev=>[{
         id:Date.now(), ts:new Date().toISOString().replace("T"," ").slice(0,19),
