@@ -1,0 +1,137 @@
+/**
+ * awsFetcher.js
+ * ──────────────────────────────────────────────────────────────────────────────
+ * Thin wrapper that calls the Vercel serverless API route `/api/aws-query`
+ * which is the ONLY code that ever touches the raw AWS credentials.
+ *
+ * The browser never sends credentials in the request body.  Instead it sends
+ * only the accountId; the API route looks up the encrypted secret from its own
+ * secure store (AWS Secrets Manager / SSM Parameter Store / Vercel env vars).
+ *
+ * WHY THIS PATTERN?
+ * ─────────────────
+ * • Vite bundles everything into a public JS file.  Any VITE_* variable you
+ *   use becomes readable to anyone who downloads your site's JS bundle.
+ * • A serverless function runs on Vercel's private infrastructure.  The
+ *   AWS credentials live there and are never sent to the browser.
+ * • The browser only ever sees the query RESULTS (resource lists, counts).
+ *
+ * MOCK MODE
+ * ─────────
+ * When `import.meta.env.VITE_MOCK_AWS === 'true'` (or the API is unreachable)
+ * this module returns realistic-looking mock data so the UI works during
+ * local development without real AWS accounts.
+ */
+
+const MOCK = import.meta.env.VITE_MOCK_AWS !== "false"; // default to mock locally
+
+// ─── Mock inventory data (returned during local dev) ─────────────────────────
+function buildMockInventory(accountId) {
+  const seed = accountId.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+  const rng  = (min, max) => min + ((seed * 1103515245 + 12345) & 0x7fffffff) % (max - min + 1);
+
+  const ec2Names  = ["web-prod-01","web-prod-02","api-server","bastion-host","nat-instance","worker-01","worker-02","db-proxy"];
+  const eksNames  = ["prod-cluster","staging-cluster","data-pipeline"];
+  const s3Names   = ["my-app-assets","backup-bucket","logs-archive","terraform-state","media-uploads"];
+  const vpcNames  = ["vpc-prod","vpc-staging","vpc-shared-services"];
+  const albNames  = ["alb-web-public","alb-api-internal","alb-admin"];
+
+  const ec2Count  = rng(3, 8);
+  const eksCount  = rng(1, 3);
+  const s3Count   = rng(3, 5);
+  const vpcCount  = rng(1, 3);
+  const albCount  = rng(1, 3);
+
+  return {
+    ec2: {
+      total: ec2Count,
+      running: ec2Count - rng(0, 2),
+      stopped: rng(0, 2),
+      instances: ec2Names.slice(0, ec2Count).map((name, i) => ({
+        id:    `i-0${(seed + i).toString(16).padStart(16, "0").slice(0, 16)}`,
+        name,
+        type:  ["t3.micro","t3.small","t3.medium","m5.large","c5.xlarge"][i % 5],
+        state: i < ec2Count - rng(0, 2) ? "running" : "stopped",
+        az:    ["us-east-1a","us-east-1b","us-east-1c"][i % 3],
+      })),
+    },
+    eks: {
+      total: eksCount,
+      clusters: eksNames.slice(0, eksCount).map((name, i) => ({
+        name,
+        nodeCount: rng(2, 10),
+        version:   `1.${28 + i}`,
+        status:    "ACTIVE",
+      })),
+    },
+    s3: {
+      total: s3Count,
+      public: rng(0, 2),
+      private: s3Count - rng(0, 2),
+      buckets: s3Names.slice(0, s3Count).map((name, i) => ({
+        name,
+        // A bucket is "public" if it has a public ACL or bucket policy allowing s3:GetObject to *
+        isPublic: i < rng(0, 2),
+        region:   ["us-east-1","us-west-2","eu-west-1"][i % 3],
+        sizeGB:   rng(1, 500),
+      })),
+    },
+    vpc: {
+      total: vpcCount,
+      vpcs: vpcNames.slice(0, vpcCount).map((name, i) => ({
+        id:      `vpc-0${(seed + i + 100).toString(16).padStart(8, "0")}`,
+        name,
+        cidr:    `10.${i}.0.0/16`,
+        subnets: rng(3, 8),
+        isDefault: i === 0,
+      })),
+    },
+    alb: {
+      total: albCount,
+      loadBalancers: albNames.slice(0, albCount).map((name, i) => ({
+        name,
+        scheme:   i === 0 ? "internet-facing" : "internal",
+        state:    "active",
+        dns:      `${name}.${accountId.slice(-4)}.elb.amazonaws.com`,
+        targets:  rng(2, 8),
+      })),
+    },
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+// ─── Real API call (Vercel serverless route) ──────────────────────────────────
+async function fetchFromAPI(accountId, region) {
+  const res = await fetch("/api/aws-query", {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    // NOTE: we only send accountId, NOT the keys.
+    // The serverless function resolves the keys from its secure store.
+    body: JSON.stringify({ accountId, region, service: "inventory" }),
+  });
+  if (!res.ok) {
+    const err = await res.text().catch(() => res.statusText);
+    throw new Error(`AWS query failed: ${err}`);
+  }
+  return res.json();
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+/**
+ * Fetch AWS resource inventory for a given account.
+ * In MOCK mode returns generated data immediately.
+ * In production hits the /api/aws-query serverless endpoint.
+ *
+ * @param {string} accountId  – 12-digit AWS account ID
+ * @param {string} region
+ * @returns {Promise<InventoryData>}
+ */
+export async function fetchInventory(accountId, region) {
+  if (MOCK) {
+    // Simulate network latency
+    await new Promise((r) => setTimeout(r, 600 + Math.random() * 800));
+    return buildMockInventory(accountId);
+  }
+  return fetchFromAPI(accountId, region);
+}
