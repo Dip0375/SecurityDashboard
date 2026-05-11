@@ -112,7 +112,7 @@ async function sendViaSendGrid({ to, from, subject, html, text }) {
 }
 
 async function sendViaGmail({ to, from, subject, html, text }) {
-  const transporter = nodemailer.createTransporter({
+  const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
       user: process.env.GMAIL_USER,
@@ -132,7 +132,7 @@ async function sendViaGmail({ to, from, subject, html, text }) {
 }
 
 async function sendViaSMTP({ to, from, subject, html, text }) {
-  const transporter = nodemailer.createTransporter({
+  const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: parseInt(process.env.SMTP_PORT) || 587,
     secure: process.env.SMTP_SECURE === 'true',

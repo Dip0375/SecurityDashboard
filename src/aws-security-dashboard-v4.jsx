@@ -272,7 +272,7 @@ async function loginWithServer(email, password) {
     body: JSON.stringify({ email, password }),
   });
 
-  if (res.status === 404) return null;
+  if (res.status === 401 || res.status === 404) return null;
   if (!res.ok) {
     const payload = await res.json().catch(() => ({}));
     throw new Error(payload.error || "Invalid email or password.");
@@ -280,6 +280,29 @@ async function loginWithServer(email, password) {
 
   const payload = await res.json();
   return { ...payload.user, password };
+}
+
+function readStoredJson(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStoredJson(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (err) {
+    console.warn(`[storage] Could not persist ${key}:`, err);
+  }
+}
+
+function usePersistentState(key, fallback) {
+  const [value, setValue] = useState(() => readStoredJson(key, fallback));
+  useEffect(() => writeStoredJson(key, value), [key, value]);
+  return [value, setValue];
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -978,7 +1001,7 @@ function Sidebar({ active, setActive, role, user, onLogout, onChangePassword, on
 }
 
 // ─── Header ───────────────────────────────────────────────────────────────────
-function Header({ accounts, selected, setSelected, section, timeRange, setTimeRange, currentUser, onChangePassword, onNotifSettings }) {
+function Header({ accounts, selected, setSelected, section, timeRange, setTimeRange, currentUser, onChangePassword, onNotifSettings, onRefresh, refreshing }) {
   const acc  = accounts.find(a=>a.id===selected)||accounts[0];
   const risk = calcRisk(acc);
   const navItem = NAV.find(n=>n.id===section);
@@ -1016,6 +1039,16 @@ function Header({ accounts, selected, setSelected, section, timeRange, setTimeRa
             </div>
           </>
         )}
+
+        <button onClick={onRefresh} disabled={refreshing}
+          style={{ width:36, height:36, borderRadius:8, background:C.card2, border:`1px solid ${C.border2}`,
+            display:"flex", alignItems:"center", justifyContent:"center", cursor:refreshing?"not-allowed":"pointer",
+            color:C.cyan, transition:"border-color 0.15s", opacity:refreshing?0.65:1 }}
+          onMouseEnter={e=>e.currentTarget.style.borderColor=C.cyan}
+          onMouseLeave={e=>e.currentTarget.style.borderColor=C.border2}
+          title="Refresh current page">
+          <RefreshCw size={15} style={refreshing?{animation:"spin 1s linear infinite"}:{}}/>
+        </button>
 
         {/* Notification bell */}
         <button onClick={onNotifSettings}
@@ -1583,26 +1616,28 @@ function RiskSection({ account }) {
 }
 
 // ─── Users Section ────────────────────────────────────────────────────────────
-function UsersSection({ users, setUsers, addToast }) {
+function UsersSection({ users, setUsers, setCredentials, addToast, logEvent }) {
   if (!users) users = [];
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm]       = useState({ name:"", email:"", role:"viewer", password:"" });
   const [showPw, setShowPw]   = useState(false);
   const strength = getPasswordStrength(form.password);
 
-  function addUser() {
+  async function addUser() {
     if (!form.name||!form.email||!form.password) return;
     if (form.password.length < 14) { addToast("Password must be at least 14 characters", "error"); return; }
     if (strength.passed < 4) { addToast("Password is too weak", "error"); return; }
 
-    // Send welcome email
-    fetch('/api/send-email', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        to: form.email,
-        subject: 'Welcome to AWS SecureView Dashboard',
-        html: `
+    const newUser = { id:Date.now(), ...form, lastLogin:"Never" };
+    let emailSent = false;
+    try {
+      const res = await fetch('/api/send-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          to: form.email,
+          subject: 'Welcome to AWS SecureView Dashboard',
+          html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
             <h2 style="color: #00d4ff;">Welcome to AWS SecureView!</h2>
             <p>Hi ${form.name},</p>
@@ -1618,7 +1653,7 @@ function UsersSection({ users, setUsers, addToast }) {
             <p>Best regards,<br>AWS SecureView Team</p>
           </div>
         `,
-        text: `
+          text: `
 Welcome to AWS SecureView!
 
 Hi ${form.name},
@@ -1637,14 +1672,21 @@ If you have any questions, contact your system administrator.
 Best regards,
 AWS SecureView Team
         `
-      })
-    }).catch(err => {
+        })
+      });
+      emailSent = res.ok;
+      if (!res.ok) console.warn('Welcome email failed:', await res.text());
+    } catch(err) {
       console.warn('Welcome email failed to send:', err);
-      // Don't block user creation if email fails
-    });
+    }
 
-    setUsers(u=>[...u,{ id:Date.now(), ...form, lastLogin:"Never" }]);
-    addToast(`User ${form.name} created. Welcome email sent to ${form.email}`, "success");
+    setUsers(u=>[...u,newUser]);
+    setCredentials(prev=>[...prev,{
+      email:form.email, password:form.password, role:form.role, name:form.name,
+      notifyEmail:form.email, notificationsEnabled:true
+    }]);
+    logEvent("user_add", `Created ${form.role} user ${form.email}${emailSent ? " and sent welcome email" : "; welcome email not sent"}`, emailSent ? "success" : "warning");
+    addToast(emailSent ? `User ${form.name} created. Welcome email sent to ${form.email}` : `User ${form.name} created. Email provider is not configured or failed.`, emailSent ? "success" : "warning");
     setForm({ name:"", email:"", role:"viewer", password:"" });
     setShowAdd(false);
   }
@@ -1746,7 +1788,7 @@ AWS SecureView Team
                   </td>
                   <td style={{ padding:"12px 14px", color:C.textSec, fontFamily:"monospace", fontSize:11 }}>{u.lastLogin}</td>
                   <td style={{ padding:"12px 14px" }}>
-                    <button onClick={()=>{ setUsers(prev=>prev.filter(x=>x.id!==u.id)); addToast(`User ${u.name} removed`, "info"); }}
+                    <button onClick={()=>{ setUsers(prev=>prev.filter(x=>x.id!==u.id)); setCredentials(prev=>prev.filter(x=>x.email!==u.email)); logEvent("user_delete", `Removed user ${u.email}`, "warning"); addToast(`User ${u.name} removed`, "info"); }}
                       style={{ background:`${C.red}15`, border:`1px solid ${C.red}35`, borderRadius:7,
                         padding:"5px 10px", color:C.red, fontSize:11, cursor:"pointer",
                         display:"flex", alignItems:"center", gap:5, fontWeight:600 }}>
@@ -1764,7 +1806,7 @@ AWS SecureView Team
 }
 
 // ─── Accounts Section ─────────────────────────────────────────────────────────
-function AccountsSection({ accounts, setAccounts, addToast }) {
+function AccountsSection({ accounts, setAccounts, addToast, logEvent }) {
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({ id:"", name:"", region:"us-east-1", accessKey:"", secretKey:"" });
   const [saving, setSaving] = useState(false);
@@ -1790,6 +1832,7 @@ function AccountsSection({ accounts, setAccounts, addToast }) {
         region:          form.region,
       });
       setAccounts(prev=>[...prev,{ ...ACCOUNT_TEMPLATE, id:form.id, name:form.name, region:form.region }]);
+      logEvent("account_add", `Onboarded AWS account ${form.name} (${form.id}) in ${form.region}`, "success");
       addToast(`Account "${form.name}" onboarded — credentials encrypted & saved`, "success");
       setForm({ id:"", name:"", region:"us-east-1", accessKey:"", secretKey:"" });
       setShowAdd(false);
@@ -1945,7 +1988,7 @@ function AccountsSection({ accounts, setAccounts, addToast }) {
 }
 
 // ─── Inventory Section ────────────────────────────────────────────────────────
-function InventorySection({ account }) {
+function InventorySection({ account, refreshSignal }) {
   const [data,    setData]    = useState(null);
   const [loading, setLoading] = useState(false);
   const [error,   setError]   = useState(null);
@@ -1973,7 +2016,7 @@ function InventorySection({ account }) {
     }
   }, [account.id, account.region]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { load(); }, [load, refreshSignal]);
 
   const sectionIcon = (Icon, color) => (
     <div style={{ width:32, height:32, borderRadius:8, background:`${color}18`,
@@ -2153,18 +2196,11 @@ function InventorySection({ account }) {
 
 // ─── Audit Log Section ────────────────────────────────────────────────────────
 function AuditLogSection({ auditLog }) {
-  if (!auditLog || auditLog.length === 0) {
-    return (
-      <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", minHeight:400, gap:16 }}>
-        <FileText size={40} color={C.textMut}/>
-        <p style={{ color:C.textSec, fontSize:14 }}>No audit log entries yet</p>
-      </div>
-    );
-  }
   const [search,  setSearch]  = useState("");
   const [filter,  setFilter]  = useState("all");
   const [page,    setPage]    = useState(1);
   const PER_PAGE = 15;
+  auditLog = auditLog || [];
 
   const filtered = auditLog.filter(e => {
     const q = search.toLowerCase();
@@ -2288,17 +2324,34 @@ function AuditLogSection({ auditLog }) {
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const [credentials,  setCredentials]  = useState(() => getEnvironmentCredentials());
-  const [currentUser,  setCurrentUser]  = useState(null);
-  const [section,      setSection]      = useState("overview");
-  const [selectedAcc,  setSelectedAcc]  = useState(null);
-  const [accounts,     setAccounts]     = useState([]);
-  const [users,        setUsers]        = useState(INIT_USERS);
-  const [auditLog,     setAuditLog]     = useState(INITIAL_AUDIT_LOG);
-  const [timeRange,    setTimeRange]    = useState({ type:"relative", value:"24h" });
+  const [credentials,  setCredentials]  = usePersistentState("asv_credentials", getEnvironmentCredentials());
+  const [currentUser,  setCurrentUser]  = usePersistentState("asv_current_user", null);
+  const [section,      setSection]      = usePersistentState("asv_section", "overview");
+  const [selectedAcc,  setSelectedAcc]  = usePersistentState("asv_selected_account", null);
+  const [accounts,     setAccounts]     = usePersistentState("asv_accounts", []);
+  const [users,        setUsers]        = usePersistentState("asv_users", INIT_USERS);
+  const [auditLog,     setAuditLog]     = usePersistentState("asv_audit_log", INITIAL_AUDIT_LOG);
+  const [timeRange,    setTimeRange]    = usePersistentState("asv_time_range", { type:"relative", value:"24h" });
+  const [refreshSignal, setRefreshSignal] = useState(0);
+  const [refreshingPage, setRefreshingPage] = useState(false);
   const [showChangePwd, setShowChangePwd] = useState(false);
   const [showNotif,     setShowNotif]   = useState(false);
   const { toasts, addToast, removeToast } = useToast();
+
+  useEffect(() => {
+    if (currentUser?.email && currentUser?.password) {
+      initStore(currentUser.email + ":" + currentUser.password).catch(err => {
+        console.warn("Could not restore encrypted credential store:", err);
+      });
+    }
+  }, [currentUser?.email, currentUser?.password]);
+
+  useEffect(() => {
+    if (!selectedAcc && accounts[0]?.id) setSelectedAcc(accounts[0].id);
+    if (selectedAcc && accounts.length && !accounts.some(a => a.id === selectedAcc)) {
+      setSelectedAcc(accounts[0].id);
+    }
+  }, [accounts, selectedAcc, setSelectedAcc]);
 
   const scaledAccounts = useMemo(()=>{
     const factor = getScaleFactor(timeRange);
@@ -2322,6 +2375,13 @@ export default function App() {
     }, ...prev]);
   }
 
+  function refreshCurrentPage() {
+    setRefreshingPage(true);
+    setRefreshSignal(v => v + 1);
+    logEvent("view_section", `Refreshed ${NAV.find(n=>n.id===section)?.label || section}`, "info");
+    setTimeout(() => setRefreshingPage(false), 800);
+  }
+
   if (!currentUser) {
     return <LoginScreen onLogin={async cred=>{
       // ── init the credential store with the user's session passphrase ──
@@ -2331,6 +2391,7 @@ export default function App() {
           ? prev.map(u => u.email === cred.email ? { ...u, ...cred } : u)
           : [...prev, cred]
       );
+      setUsers(prev => prev.map(u => u.email === cred.email ? { ...u, lastLogin:new Date().toISOString().replace("T"," ").slice(0,19) } : u));
       setCurrentUser({ ...(credentials.find(u=>u.email===cred.email)||{}), ...cred });
       setAuditLog(prev=>[{
         id:Date.now(), ts:new Date().toISOString().replace("T"," ").slice(0,19),
@@ -2381,6 +2442,8 @@ export default function App() {
           onLogout={()=>{ setCurrentUser(null); setSection("overview"); }}
           onChangePassword={()=>setShowChangePwd(true)}
           onNotifSettings={()=>setShowNotif(true)}
+          onRefresh={refreshCurrentPage}
+          refreshing={refreshingPage}
         />
         <div style={{ flex:1, display:"flex", flexDirection:"column", minWidth:0, overflow:"hidden" }}>
           <Header
@@ -2394,16 +2457,16 @@ export default function App() {
             onChangePassword={()=>setShowChangePwd(true)}
             onNotifSettings={()=>setShowNotif(true)}
           />
-          <div style={{ flex:1, padding:22, overflowY:"auto" }}>
+          <div key={`${section}-${refreshSignal}`} style={{ flex:1, padding:22, overflowY:"auto" }}>
             {section==="overview"    && <OverviewSection accounts={scaledAccounts} setActive={setSection} setSelected={setSelectedAcc}/>}
-            {section==="inventory"   && <InventorySection account={account}/>}
+            {section==="inventory"   && <InventorySection account={account} refreshSignal={refreshSignal}/>}
             {section==="waf"         && <WAFSection account={account}/>}
             {section==="securityhub" && <SecurityHubSection account={account}/>}
             {section==="guardduty"   && <GuardDutySection account={account}/>}
             {section==="inspector"   && <InspectorSection account={account}/>}
             {section==="risk"        && <RiskSection account={account}/>}
-            {section==="users"       && currentUser.role==="admin" && <UsersSection users={users} setUsers={setUsers} addToast={addToast}/>}
-            {section==="accounts"    && currentUser.role==="admin" && <AccountsSection accounts={accounts} setAccounts={setAccounts} addToast={addToast}/>}
+            {section==="users"       && currentUser.role==="admin" && <UsersSection users={users} setUsers={setUsers} setCredentials={setCredentials} addToast={addToast} logEvent={logEvent}/>}
+            {section==="accounts"    && currentUser.role==="admin" && <AccountsSection accounts={accounts} setAccounts={setAccounts} addToast={addToast} logEvent={logEvent}/>}
             {section==="auditlog"    && currentUser.role==="admin" && <AuditLogSection auditLog={auditLog}/>}
             {section==="settings"    && <SettingsSection currentUser={currentUser} credentials={credentials} setCredentials={setCredentials} addToast={addToast}/>}
           </div>
