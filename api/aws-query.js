@@ -56,8 +56,6 @@ import {
 import {
   SecurityHubClient,
   GetFindingsCommand,
-  ListStandardsCommand,
-  ListStandardsSubscriptionsCommand,
 } from "@aws-sdk/client-securityhub";
 import {
   GuardDutyClient,
@@ -68,7 +66,6 @@ import {
 import {
   Inspector2Client,
   ListFindingsCommand as ListInspectorFindingsCommand,
-  BatchGetFindingsCommand,
 } from "@aws-sdk/client-inspector2";
 
 // ─── Resolve credentials from environment ────────────────────────────────────
@@ -319,25 +316,6 @@ async function getSecurityHubData(client) {
     nextToken = res.NextToken;
   } while (nextToken && findings.length < 300);
 
-  const standardsConfig = [];
-  try {
-    const [all, subs] = await Promise.all([
-      client.send(new ListStandardsCommand({})),
-      client.send(new ListStandardsSubscriptionsCommand({})),
-    ]);
-    const subMap = new Map((subs.StandardsSubscriptions || []).map(s => [s.StandardsArn, s.SubscriptionStatus]));
-    (all.Standards || []).forEach(std => {
-      standardsConfig.push({
-        arn: std.StandardsArn,
-        name: std.Name,
-        description: std.Description,
-        status: subMap.get(std.StandardsArn) || "DISABLED",
-      });
-    });
-  } catch (err) {
-    console.warn("SecurityHub standards metadata unavailable:", err.message);
-  }
-
   const counts = emptySeverity();
   const regions = new Map();
   const findingItems = findings.map(f => {
@@ -362,7 +340,7 @@ async function getSecurityHubData(client) {
     score: Math.max(0, 100 - weighted),
     ...counts,
     trend: [],
-    standards: standardsConfig,
+    standards: [],
     findingsByRegion,
     findings: findingItems.slice(0, 25),
   };
@@ -427,7 +405,7 @@ async function getGuardDutyData(client) {
 }
 
 async function getInspectorData(client) {
-  const arns = [];
+  const findings = [];
   let nextToken;
   do {
     const res = await client.send(new ListInspectorFindingsCommand({
@@ -435,15 +413,9 @@ async function getInspectorData(client) {
       nextToken,
       filterCriteria: { findingStatus: [{ comparison: "EQUALS", value: "ACTIVE" }] },
     }));
-    arns.push(...(res.findings || []));
-    nextToken = res.nextToken;
-  } while (nextToken && arns.length < 300);
-
-  const findings = [];
-  if (arns.length) {
-    const res = await client.send(new BatchGetFindingsCommand({ findingArns: arns.slice(0, 100) }));
     findings.push(...(res.findings || []));
-  }
+    nextToken = res.nextToken;
+  } while (nextToken && findings.length < 300);
 
   const counts = emptySeverity();
   const resourceTypes = new Map();
