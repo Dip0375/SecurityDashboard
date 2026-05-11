@@ -38,7 +38,14 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Email and password are required" });
   }
 
-  const user = getDashboardCredentials().find(
+  const credentials = getDashboardCredentials();
+  if (credentials.length === 0) {
+    return res.status(503).json({
+      error: "Dashboard login credentials are not configured in Vercel.",
+    });
+  }
+
+  const user = credentials.find(
     (cred) => cred.email === email && cred.password === password
   );
 
