@@ -230,15 +230,49 @@ function TimeRangePicker({ value, onChange }) {
 // ─── Account Template (for adding new accounts) ──────────────────────────────────
 const ACCOUNT_TEMPLATE = {
   waf: {
-    allow: 0, block: 0, count: 0, challenge: 0, captcha: 0,
+    allow: 0,
+    block: 0,
+    count: 0,
+    challenge: 0,
+    captcha: 0,
+    configuredRules: 0,
+    webACLs: [],
     topGeoIPs: [],
     topURIs: [],
     blockedRules: [],
-    configuredRules: 0,
   },
-  securityHub: { score: 0, critical: 0, high: 0, medium: 0, low: 0, trend: [] },
-  guardDuty: { findings: 0, high: 0, medium: 0, low: 0, types: [] },
-  inspector: { score: 0, critical: 0, high: 0, medium: 0, low: 0, findings: [] }
+  securityHub: {
+    score: 0,
+    critical: 0,
+    high: 0,
+    medium: 0,
+    low: 0,
+    trend: [],
+    standards: [],
+    findingsByRegion: [],
+    findings: [],
+  },
+  guardDuty: {
+    findings: 0,
+    high: 0,
+    medium: 0,
+    low: 0,
+    types: [],
+    findingsList: [],
+    findingsByRegion: [],
+    topResources: [],
+  },
+  inspector: {
+    score: 0,
+    critical: 0,
+    high: 0,
+    medium: 0,
+    low: 0,
+    findings: [],
+    findingsList: [],
+    criticalFindings: [],
+    resourceTypes: [],
+  },
 };
 
 // ─── Initial Users (cleared — add your own) ───────────────────────────────────
@@ -326,6 +360,9 @@ function accountFromInventory(account, inventory) {
       ...account.securityHub,
       ...inventory.securityHub,
       trend: inventory.securityHub.trend?.length ? inventory.securityHub.trend : account.securityHub.trend || [],
+      standards: inventory.securityHub.standards || account.securityHub.standards || [],
+      findingsByRegion: inventory.securityHub.findingsByRegion || account.securityHub.findingsByRegion || [],
+      findings: inventory.securityHub.findings || account.securityHub.findings || [],
     } : {
       ...account.securityHub,
       score,
@@ -334,10 +371,16 @@ function accountFromInventory(account, inventory) {
       medium: stoppedEc2,
       low: Math.max(0, totalResources - exposure - stoppedEc2),
       trend: account.securityHub.trend || [],
+      standards: account.securityHub.standards || [],
+      findingsByRegion: account.securityHub.findingsByRegion || [],
+      findings: account.securityHub.findings || [],
     },
     guardDuty: inventory?.guardDuty ? {
       ...account.guardDuty,
       ...inventory.guardDuty,
+      findingsList: inventory.guardDuty.findingsList || account.guardDuty.findingsList || [],
+      findingsByRegion: inventory.guardDuty.findingsByRegion || account.guardDuty.findingsByRegion || [],
+      topResources: inventory.guardDuty.topResources || account.guardDuty.topResources || [],
     } : {
       ...account.guardDuty,
       findings: exposure,
@@ -348,10 +391,16 @@ function accountFromInventory(account, inventory) {
         ...(publicS3 ? [{ type:"S3/BucketPublicAccess", count:publicS3, severity:"high" }] : []),
         ...(publicAlb ? [{ type:"Recon/PublicLoadBalancerExposure", count:publicAlb, severity:"medium" }] : []),
       ],
+      findingsList: [],
+      findingsByRegion: [],
+      topResources: [],
     },
     inspector: inventory?.inspector ? {
       ...account.inspector,
       ...inventory.inspector,
+      findingsList: inventory.inspector.findingsList || account.inspector.findingsList || [],
+      criticalFindings: inventory.inspector.criticalFindings || account.inspector.criticalFindings || [],
+      resourceTypes: inventory.inspector.resourceTypes || account.inspector.resourceTypes || [],
     } : {
       ...account.inspector,
       score: Math.max(40, 100 - stoppedEc2 * 5),
@@ -362,10 +411,14 @@ function accountFromInventory(account, inventory) {
       findings: (inventory?.ec2?.instances || [])
         .filter(i => i.state !== "running")
         .map(i => ({ resource:i.id, type:"Stopped EC2 instance", severity:"high" })),
+      findingsList: [],
+      criticalFindings: [],
+      resourceTypes: [],
     },
     waf: inventory?.waf ? {
       ...account.waf,
       ...inventory.waf,
+      webACLs: inventory.waf.webACLs || account.waf.webACLs || [],
       topGeoIPs: inventory.waf.topGeoIPs?.length ? inventory.waf.topGeoIPs : account.waf.topGeoIPs || [],
       topURIs: inventory.waf.topURIs?.length ? inventory.waf.topURIs : account.waf.topURIs || [],
       blockedRules: inventory.waf.blockedRules?.length ? inventory.waf.blockedRules : account.waf.blockedRules || [],
@@ -377,6 +430,7 @@ function accountFromInventory(account, inventory) {
       challenge: publicAlb,
       captcha: publicS3,
       configuredRules: totalResources,
+      webACLs: [],
       topGeoIPs: [],
       topURIs: (inventory?.s3?.buckets || []).slice(0, 5).map(b => ({ uri:b.name, requests:b.isPublic ? 1 : 0 })),
       blockedRules: [
@@ -1409,130 +1463,174 @@ function OverviewSection({ accounts, setActive, setSelected }) {
 // ─── WAF Section ──────────────────────────────────────────────────────────────
 function WAFSection({ account }) {
   if (!account) {
-    return (
-      <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", minHeight:400, gap:16 }}>
-        <Shield size={40} color={C.textMut}/>
-        <p style={{ color:C.textSec, fontSize:14 }}>Select an AWS account to view WAF data</p>
-      </div>
-    );
-  }
+      return (
+            <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", minHeight:400, gap:16 }}>
+                    <Shield size={40} color={C.textMut}/>
+                            <p style={{ color:C.textSec, fontSize:14 }}>Select an AWS account to view WAF data</p>
+                                  </div>
+                                      );
+                                        }
+                                        
   const w = account.waf;
-  const webACLs = w?.webACLs || [];
+    const webACLs = w?.webACLs || [];
+      const [selectedIndex, setSelectedIndex] = useState(0);
+        const selectedACL = webACLs[selectedIndex] || webACLs[0] || null;
+        
+  useEffect(() => {
+      if (webACLs.length && selectedIndex >= webACLs.length) {
+            setSelectedIndex(0);
+                }
+                  }, [webACLs.length, selectedIndex]);
+                  
+  const protectedResources = webACLs.reduce((sum, acl) => sum + (acl.attachedResources?.length || 0), 0);
+    const totalTraffic = w.totalTraffic ?? (w.allow + w.block + w.count + w.challenge + w.captcha);
+    
+  const attackTypes = useMemo(() => {
+      if (w.attackTypes?.length) return w.attackTypes;
+          return (w.blockedRules || []).slice(0, 10).map(r => ({ type: r.rule, requests: r.blocks }));
+            }, [w.attackTypes, w.blockedRules]);
+            
+  const managedGroups = useMemo(() => {
+      if (w.managedRuleGroups?.length) return w.managedRuleGroups;
+          const map = new Map();
+              webACLs.forEach(acl => {
+                    (acl.rules || []).forEach(rule => {
+                            if (!rule.ruleGroup) return;
+                                    const entry = map.get(rule.ruleGroup) || { name: rule.ruleGroup, ruleCount: 0, webACLs: new Set() };
+                                            entry.ruleCount += 1;
+                                                    entry.webACLs.add(acl.name);
+                                                            map.set(rule.ruleGroup, entry);
+                                                                  });
+                                                                      });
+                                                                          return Array.from(map.values()).map(entry => ({ name: entry.name, ruleCount: entry.ruleCount, webACLs: Array.from(entry.webACLs) }));
+                                                                            }, [w.managedRuleGroups, webACLs]);
+                                                                            
+  const webACLOptions = webACLs.map((acl, idx) => ({
+      value: idx,
+          label: `${acl.name} (${acl.scope}) — ${acl.attachedResources?.length ?? 0} resources`,
+            }));
+            
   return (
-    <div style={{ display:"flex", flexDirection:"column", gap:18 }}>
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(6,1fr)", gap:12 }}>
-        <Stat label="Allow"     value={fmtNum(w.allow)}     color={C.green}  icon={CheckCircle}/>
-        <Stat label="Block"     value={fmtNum(w.block)}     color={C.red}    icon={XCircle}/>
-        <Stat label="Count"     value={fmtNum(w.count)}     color={C.yellow} icon={Activity}/>
-        <Stat label="Challenge" value={fmtNum(w.challenge)} color={C.orange} icon={AlertTriangle}/>
-        <Stat label="CAPTCHA"   value={fmtNum(w.captcha)}   color={C.purple} icon={Lock}/>
-        <Stat label="Web ACLs"  value={fmtNum(webACLs.length)} color={C.orange} icon={Shield}/>
-      </div>
-      {webACLs.length > 0 && (
-        <div style={card()}>
-          <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 14px" }}>Web ACL Summary</h3>
-          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
-            <thead>
-              <tr style={{ borderBottom:`1px solid ${C.border}` }}>
-                {['Name','Scope','Default Action','Rules'].map(h => (
-                  <th key={h} style={{ color:C.textSec, padding:"8px 12px", textAlign:"left", fontWeight:600, fontSize:11, textTransform:"uppercase", letterSpacing:"0.06em" }}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {webACLs.map((acl, idx) => (
-                <tr key={idx} style={{ borderBottom:`1px solid ${C.border}22` }}>
-                  <td style={{ padding:"10px 12px", color:C.textPri }}>{acl.name}</td>
-                  <td style={{ padding:"10px 12px", color:C.textSec }}>{acl.scope}</td>
-                  <td style={{ padding:"10px 12px", color:acl.defaultAction==="BLOCK"?C.red:C.green }}>{acl.defaultAction}</td>
-                  <td style={{ padding:"10px 12px", color:C.textSec }}>{acl.rules?.length ?? 0}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:18 }}>
-        <div style={card()}>
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
-            <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:0 }}>Top 10 Blocked Geo IPs</h3>
-            <Globe size={15} color={C.textSec}/>
-          </div>
-          <div style={{ height:260 }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={w.topGeoIPs} layout="vertical">
-                <CartesianGrid strokeDasharray="3 3" stroke={C.border} horizontal={false}/>
-                <XAxis type="number" tick={{fill:C.textSec,fontSize:11}} axisLine={false} tickLine={false}/>
-                <YAxis dataKey="country" type="category" width={32} tick={{fill:C.textSec,fontSize:12}} axisLine={false} tickLine={false}/>
-                <Tooltip contentStyle={tooltipStyle} cursor={{fill:`${C.red}0a`}}/>
-                <Bar dataKey="requests" radius={[0,4,4,0]}>
-                  {w.topGeoIPs.map((_,i)=><Cell key={i} fill={i<3?C.red:i<6?C.orange:C.yellow}/>)}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-        <div style={card()}>
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
-            <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:0 }}>Top 10 Attacked URIs</h3>
-            <Server size={15} color={C.textSec}/>
-          </div>
-          <div style={{ height:260 }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={w.topURIs} layout="vertical">
-                <CartesianGrid strokeDasharray="3 3" stroke={C.border} horizontal={false}/>
-                <XAxis type="number" tick={{fill:C.textSec,fontSize:11}} axisLine={false} tickLine={false}/>
-                <YAxis dataKey="uri" type="category" width={120} tick={{fill:C.textSec,fontSize:10}} axisLine={false} tickLine={false}/>
-                <Tooltip contentStyle={tooltipStyle} cursor={{fill:`${C.orange}0a`}}/>
-                <Bar dataKey="requests" radius={[0,4,4,0]}>
-                  {w.topURIs.map((_,i)=><Cell key={i} fill={i<3?C.red:i<6?C.orange:C.yellow}/>)}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-      </div>
+      <div style={{ display:"flex", flexDirection:"column", gap:18 }}>
+            <div style={card()}>
+                    <div style={{ display:"flex", flexWrap:"wrap", gap:18, justifyContent:"space-between", alignItems:"flex-start" }}>
+                              <div style={{ minWidth:260, flex:1 }}>
+                                          <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 12px" }}>Available Web ACLs</h3>
+                                                      {webACLOptions.length === 0 ? (
+                                                                    <p style={{ color:C.textSec, fontSize:12, margin:0 }}>No Web ACLs detected for this account.</p>
+                                                                                ) : (
+                                                                                              <select value={selectedIndex} onChange={e => setSelectedIndex(Number(e.target.value))}
+                                                                                                              style={{ width:"100%", background:C.card2, border:`1px solid ${C.border2}`, borderRadius:10,
+                                                                                                                                color:C.textPri, padding:"10px 12px", fontSize:13, outline:"none" }}>
+                                                                                                                                                {webACLOptions.map(opt => (
+                                                                                                                                                                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                                                                                                                                                                  ))}
+                                                                                                                                                                                                </select>
+                                                                                                                                                                                                            )}
+                                                                                                                                                                                                                      </div>
+                                                                                                                                                                                                                                {selectedACL && (
+                                                                                                                                                                                                                                            <div style={{ flex:1, minWidth:280, display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))", gap:12 }}>
+                                                                                                                                                                                                                                                          <Stat label="Scope" value={selectedACL.scope} color={C.cyan} icon={Globe}/>
+                                                                                                                                                                                                                                                                        <Stat label="Default Action" value={selectedACL.defaultAction} color={selectedACL.defaultAction === "BLOCK" ? C.red : C.green} icon={Shield}/>
+                                                                                                                                                                                                                                                                                      <Stat label="Rules" value={selectedACL.rules?.length ?? 0} color={C.yellow} icon={Activity}/>
+                                                                                                                                                                                                                                                                                                    <Stat label="Resources" value={selectedACL.attachedResources?.length ?? 0} color={C.purple} icon={Server}/>
+                                                                                                                                                                                                                                                                                                                </div>
+                                                                                                                                                                                                                                                                                                                          )}
+                                                                                                                                                                                                                                                                                                                                  </div>
+                                                                                                                                                                                                                                                                                                                                        </div>
+                                                                                                                                                                                                                                                                                                                                        
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))", gap:12 }}>
+              <Stat label="Total Traffic" value={fmtNum(totalTraffic)} color={C.cyan} icon={Globe}/>
+                      <Stat label="Allow" value={fmtNum(w.allow)} color={C.green} icon={CheckCircle}/>
+                              <Stat label="Block" value={fmtNum(w.block)} color={C.red} icon={XCircle}/>
+                                      <Stat label="COUNT" value={fmtNum(w.count)} color={C.yellow} icon={Activity}/>
+                                              <Stat label="Challenges" value={fmtNum(w.challenge)} color={C.orange} icon={AlertTriangle}/>
+                                                      <Stat label="CAPTCHA" value={fmtNum(w.captcha)} color={C.purple} icon={Lock}/>
+                                                            </div>
+                                                            
       <div style={card()}>
-        <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 14px" }}>Blocked Rules Breakdown</h3>
-        {w.error && <p style={{ color:C.orange, fontSize:12, margin:"0 0 10px" }}>{w.error}</p>}
-        <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
-          <thead>
-            <tr style={{ borderBottom:`1px solid ${C.border}` }}>
-              {["Rule Name","Blocks","% of Total"].map(h=>(
-                <th key={h} style={{ color:C.textSec, padding:"8px 14px", textAlign:"left",
-                  fontWeight:600, fontSize:11, textTransform:"uppercase", letterSpacing:"0.06em" }}>{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {w.blockedRules.length === 0 ? (
-              <tr><td colSpan={3} style={{ padding:24, color:C.textSec, textAlign:"center" }}>No WAF WebACL rules found</td></tr>
-            ) : w.blockedRules.map((r,i)=>{
-              const total = w.blockedRules.reduce((a,x)=>a+x.blocks,0)||1;
-              const pct = Math.round((r.blocks/total)*100);
-              return (
-                <tr key={i} style={{ borderBottom:`1px solid ${C.border}44` }}>
-                  <td style={{ padding:"11px 14px", color:C.textPri, fontFamily:"monospace", fontSize:12 }}>{r.rule}</td>
-                  <td style={{ padding:"11px 14px", color:C.red, fontWeight:700 }}>{fmtNum(r.blocks)}</td>
-                  <td style={{ padding:"11px 14px" }}>
-                    <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-                      <div style={{ flex:1, height:5, background:C.card2, borderRadius:3, maxWidth:120 }}>
-                        <div style={{ width:`${pct}%`, height:"100%", background:C.red, borderRadius:3 }}/>
-                      </div>
-                      <span style={{ color:C.textSec, fontSize:12, minWidth:36 }}>{pct}%</span>
-                    </div>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
+              <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 14px" }}>Selected WebACL Details</h3>
+                      {selectedACL ? (
+                                <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))", gap:12 }}>
+                                            <div style={{ padding:12, borderRadius:14, background:C.card2 }}>
+                                                          <div style={{ color:C.textSec, fontSize:11, textTransform:"uppercase", letterSpacing:"0.06em" }}>WebACL</div>
+                                                                        <div style={{ color:C.textPri, fontSize:13, fontWeight:700, marginTop:6 }}>{selectedACL.name}</div>
+                                                                                    </div>
+                                                                                                <div style={{ padding:12, borderRadius:14, background:C.card2 }}>
+                                                                                                              <div style={{ color:C.textSec, fontSize:11, textTransform:"uppercase", letterSpacing:"0.06em" }}>Scope</div>
+                                                                                                                            <div style={{ color:C.textPri, fontSize:13, fontWeight:700, marginTop:6 }}>{selectedACL.scope}</div>
+                                                                                                                                        </div>
+                                                                                                                                                    <div style={{ padding:12, borderRadius:14, background:C.card2 }}>
+                                                                                                                                                                  <div style={{ color:C.textSec, fontSize:11, textTransform:"uppercase", letterSpacing:"0.06em" }}>Attached Resources</div>
+                                                                                                                                                                                <div style={{ color:C.textPri, fontSize:13, fontWeight:700, marginTop:6 }}>{selectedACL.attachedResources?.length ?? 0}</div>
+                                                                                                                                                                                            </div>
+                                                                                                                                                                                                        <div style={{ padding:12, borderRadius:14, background:C.card2 }}>
+                                                                                                                                                                                                                      <div style={{ color:C.textSec, fontSize:11, textTransform:"uppercase", letterSpacing:"0.06em" }}>Rule Count</div>
+                                                                                                                                                                                                                                    <div style={{ color:C.textPri, fontSize:13, fontWeight:700, marginTop:6 }}>{selectedACL.rules?.length ?? 0}</div>
+                                                                                                                                                                                                                                                </div>
+                                                                                                                                                                                                                                                          </div>
+                                                                                                                                                                                                                                                                  ) : (
+                                                                                                                                                                                                                                                                            <p style={{ color:C.textSec, fontSize:12 }}>No WebACL selected.</p>
+                                                                                                                                                                                                                                                                                    )}
+                                                                                                                                                                                                                                                                                          </div>
+                                                                                                                                                                                                                                                                                          
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:18 }}>
+              <div style={card()}>
+                        <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 14px" }}>Top 10 Countries</h3>
+                                  {!(w.topGeoIPs?.length > 0) ? (
+                                              <p style={{ color:C.textSec, fontSize:12, margin:0 }}>No geo IP data available.</p>
+                                                        ) : (
+                                                                    <div style={{ display:"grid", gap:10 }}>
+                                                                                  {(w.topGeoIPs || []).slice(0, 10).map((item, i) => (
+                                                                                                  <div key={i} style={{ display:"flex", justifyContent:"space-between", gap:10, padding:12, borderRadius:12, background:C.card2 }}>
+                                                                                                                    <span style={{ color:C.textPri, fontSize:12 }}>{item.country}</span>
+                                                                                                                                      <span style={{ color:C.orange, fontWeight:700 }}>{fmtNum(item.requests)}</span>
+                                                                                                                                                      </div>
+                                                                                                                                                                    ))}
+                                                                                                                                                                                </div>
+                                                                                                                                                                                          )}
+                                                                                                                                                                                                  </div>
+                                                                                                                                                                                                  
+        <div style={card()}>
+                  <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 14px" }}>Attack Types</h3>
+                            {attackTypes.length === 0 ? (
+                                        <p style={{ color:C.textSec, fontSize:12, margin:0 }}>No attack type data available.</p>
+                                                  ) : (
+                                                              <div style={{ display:"grid", gap:10 }}>
+                                                                            {attackTypes.slice(0, 10).map((item, i) => (
+                                                                                            <div key={i} style={{ display:"flex", justifyContent:"space-between", gap:10, padding:12, borderRadius:12, background:C.card2 }}>
+                                                                                                              <span style={{ color:C.textPri, fontSize:12, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{item.type}</span>
+                                                                                                                                <span style={{ color:C.red, fontWeight:700 }}>{fmtNum(item.requests)}</span>
+                                                                                                                                                </div>
+                                                                                                                                                              ))}
+                                                                                                                                                                          </div>
+                                                                                                                                                                                    )}
+                                                                                                                                                                                            </div>
+                                                                                                                                                                                                  </div>
+                                                                                                                                                                                                  
+      <div style={card()}>
+              <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 14px" }}>Managed Rule Groups</h3>
+                      {managedGroups.length === 0 ? (
+                                <p style={{ color:C.textSec, fontSize:12, margin:0 }}>No managed rule group data available.</p>
+                                        ) : (
+                                                  <div style={{ display:"grid", gap:10 }}>
+                                                              {managedGroups.map((group, i) => (
+                                                                            <div key={i} style={{ padding:12, borderRadius:12, background:C.card2 }}>
+                                                                                            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:10 }}>
+                                                                                                              <span style={{ color:C.textPri, fontSize:13, fontWeight:700 }}>{group.name}</span>
+                                                                                                                                <span style={{ color:C.cyan, fontWeight:700 }}>{group.ruleCount} rules</span>
+                                                                                                                                                </div>
+                                                                                                                                                                <div style={{ color:C.textSec, fontSize:11, marginTop:6 }}>Web ACLs: {group.webACLs.join(", ")}</div>
+                                                                                                                                                                              </div>
+                                                                                                                                                                                          ))}
+                                                                                                                                                                                                    </div>
+                                                                                                                                                                                                            )}
+                                                                                                                                                                                                                  </div>
+                                                                                                                                                                                                                      </div>
+                                                                                                                                                                                                                        );
+                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                        
+// ─── Security Hub Section ─────────────────────────────────────────────────────
 // ─── Security Hub Section ─────────────────────────────────────────────────────
 function SecurityHubSection({ account }) {
   if (!account) {
@@ -1582,6 +1680,43 @@ function SecurityHubSection({ account }) {
               <Area type="monotone" dataKey="score" stroke={C.cyan} fill="url(#sh_grad)" strokeWidth={2}/>
             </AreaChart>
           </ResponsiveContainer>
+        </div>
+      </div>
+      <div style={card()}>
+        <div style={{ display:"grid", gridTemplateColumns:"1.2fr 0.8fr", gap:18 }}>
+          <div>
+            <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 10px" }}>Standards</h3>
+            {sh.standards.length === 0 ? (
+              <p style={{ color:C.textSec, fontSize:12, margin:0 }}>No Security Hub standards subscriptions detected.</p>
+            ) : (
+              <div style={{ display:"grid", gap:10 }}>
+                {sh.standards.map((std, i) => (
+                  <div key={i} style={{ padding:12, borderRadius:10, background:C.card2, border:`1px solid ${C.border}` }}>
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:10 }}>
+                      <div style={{ color:C.textPri, fontWeight:700, fontSize:13 }}>{std.name}</div>
+                      <Tag label={std.status.toLowerCase()} color={std.status === "ENABLED" ? C.green : C.textSec}/>
+                    </div>
+                    <div style={{ color:C.textSec, fontSize:11, marginTop:6 }}>{std.description || "No description available."}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <div>
+            <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 10px" }}>Findings by Region</h3>
+            {sh.findingsByRegion.length === 0 ? (
+              <p style={{ color:C.textSec, fontSize:12, margin:0 }}>No regional finding breakdown available.</p>
+            ) : (
+              <div style={{ display:"grid", gap:10 }}>
+                {sh.findingsByRegion.map((item, i) => (
+                  <div key={i} style={{ display:"flex", justifyContent:"space-between", gap:10, padding:10, borderRadius:10, background:C.card2 }}>
+                    <span style={{ color:C.textPri, fontSize:12 }}>{item.region}</span>
+                    <span style={{ color:C.cyan, fontWeight:700 }}>{item.count}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       </div>
       <div style={card()}>
@@ -1637,6 +1772,68 @@ function GuardDutySection({ account }) {
         </div>
       </div>
       <div style={card()}>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:18 }}>
+          <div>
+            <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 10px" }}>Top Affected Resources</h3>
+            {gd.topResources.length === 0 ? (
+              <p style={{ color:C.textSec, fontSize:12, margin:0 }}>No resource breakdown available.</p>
+            ) : (
+              <div style={{ display:"grid", gap:10 }}>
+                {gd.topResources.slice(0, 6).map((item, i) => (
+                  <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:10, borderRadius:10, background:C.card2 }}>
+                    <span style={{ color:C.textPri, fontSize:12, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{item.resource}</span>
+                    <span style={{ color:C.orange, fontWeight:700 }}>{item.count}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <div>
+            <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 10px" }}>Findings by Region</h3>
+            {gd.findingsByRegion.length === 0 ? (
+              <p style={{ color:C.textSec, fontSize:12, margin:0 }}>No regional distribution available.</p>
+            ) : (
+              <div style={{ display:"grid", gap:10 }}>
+                {gd.findingsByRegion.map((item, i) => (
+                  <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:10, borderRadius:10, background:C.card2 }}>
+                    <span style={{ color:C.textPri, fontSize:12 }}>{item.region}</span>
+                    <span style={{ color:C.cyan, fontWeight:700 }}>{item.count}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+      <div style={card()}>
+        <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 14px" }}>Recent GuardDuty Findings</h3>
+        {gd.findingsList.length === 0 ? (
+          <div style={{ color:C.textSec, fontSize:12, textAlign:"center", padding:24 }}>No recent GuardDuty findings available.</div>
+        ) : (
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+              <thead>
+                <tr style={{ borderBottom:`1px solid ${C.border}` }}>
+                  {['Type','Severity','Resource','Region'].map(h => (
+                    <th key={h} style={{ color:C.textSec, padding:"8px 10px", textAlign:"left", fontWeight:600, fontSize:11, textTransform:"uppercase", letterSpacing:"0.06em" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {gd.findingsList.slice(0, 8).map((item, i) => (
+                  <tr key={i} style={{ borderBottom:`1px solid ${C.border}22` }}>
+                    <td style={{ padding:"10px", color:C.textPri }}>{item.type}</td>
+                    <td style={{ padding:"10px" }}><Tag label={item.severity} color={sevColor(item.severity)}/></td>
+                    <td style={{ padding:"10px", color:C.textSec, fontFamily:"monospace", fontSize:12 }}>{item.resource}</td>
+                    <td style={{ padding:"10px", color:C.textSec }}>{item.region}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+      <div style={card()}>
         <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 14px" }}>Severity Breakdown</h3>
         <SevBar critical={0} high={gd.high} medium={gd.medium} low={gd.low}/>
       </div>
@@ -1670,6 +1867,41 @@ function InspectorSection({ account }) {
           <Stat label="High"     value={ins.high}     color={C.orange} icon={AlertTriangle}/>
           <Stat label="Medium"   value={ins.medium}   color={C.yellow} icon={AlertCircle}/>
           <Stat label="Low"      value={ins.low}      color={C.cyan}  icon={Info}/>
+        </div>
+      </div>
+      <div style={card()}>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:18 }}>
+          <div>
+            <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 10px" }}>Top Resource Types</h3>
+            {ins.resourceTypes.length === 0 ? (
+              <p style={{ color:C.textSec, fontSize:12, margin:0 }}>No resource type distribution available.</p>
+            ) : (
+              <div style={{ display:"grid", gap:10 }}>
+                {ins.resourceTypes.slice(0, 6).map((item, i) => (
+                  <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:10, borderRadius:10, background:C.card2 }}>
+                    <span style={{ color:C.textPri, fontSize:12 }}>{item.resourceType}</span>
+                    <span style={{ color:C.purple, fontWeight:700 }}>{item.count}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <div>
+            <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 10px" }}>Critical Findings</h3>
+            {ins.criticalFindings.length === 0 ? (
+              <p style={{ color:C.textSec, fontSize:12, margin:0 }}>No critical Inspector findings available.</p>
+            ) : (
+              <div style={{ display:"grid", gap:10 }}>
+                {ins.criticalFindings.slice(0, 6).map((item, i) => (
+                  <div key={i} style={{ padding:10, borderRadius:10, background:C.card2 }}>
+                    <div style={{ color:C.textPri, fontSize:12, fontWeight:600 }}>{item.resource}</div>
+                    <div style={{ color:C.textSec, fontSize:11, marginTop:4 }}>{item.type}</div>
+                    <Tag label={item.severity} color={sevColor(item.severity)} style={{ marginTop:8 }}/>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       </div>
       <div style={card()}>

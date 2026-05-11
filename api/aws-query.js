@@ -51,10 +51,13 @@ import {
   WAFV2Client,
   ListWebACLsCommand,
   GetWebACLCommand,
+  ListResourcesForWebACLCommand,
 } from "@aws-sdk/client-wafv2";
 import {
   SecurityHubClient,
   GetFindingsCommand,
+  ListStandardsCommand,
+  ListStandardsSubscriptionsCommand,
 } from "@aws-sdk/client-securityhub";
 import {
   GuardDutyClient,
@@ -65,6 +68,7 @@ import {
 import {
   Inspector2Client,
   ListFindingsCommand as ListInspectorFindingsCommand,
+  BatchGetFindingsCommand,
 } from "@aws-sdk/client-inspector2";
 
 // ─── Resolve credentials from environment ────────────────────────────────────
@@ -222,38 +226,80 @@ async function getWAFData(client) {
       const res = await client.send(new ListWebACLsCommand({ Scope: scope, Limit: 100 }));
       for (const acl of res.WebACLs || []) {
         let detail = null;
+        let attachedResources = [];
         try {
           const full = await client.send(new GetWebACLCommand({ Scope: scope, Name: acl.Name, Id: acl.Id }));
           detail = full.WebACL;
         } catch { /* list data is still useful */ }
+        try {
+          const resources = await client.send(new ListResourcesForWebACLCommand({ WebACLArn: acl.ARN }));
+          attachedResources = resources.ResourceArns || [];
+        } catch { /* not all WebACLs will support resource listing */ }
         webACLs.push({
           name: acl.Name,
           id: acl.Id,
           scope,
           arn: acl.ARN,
+          attachedResources,
           defaultAction: detail?.DefaultAction?.Allow ? "ALLOW" : detail?.DefaultAction?.Block ? "BLOCK" : "UNKNOWN",
           rules: (detail?.Rules || []).map(r => ({
             name: r.Name,
             priority: r.Priority,
             action: r.Action?.Allow ? "ALLOW" : r.Action?.Block ? "BLOCK" : r.Action?.Count ? "COUNT" : "MANAGED",
+            ruleGroup: r.RuleGroupReference?.Name || null,
           })),
         });
       }
     } catch { /* scope may be unavailable in this region */ }
   }
 
-  const rules = webACLs.flatMap(acl => acl.rules.map(rule => ({ ...rule, webAcl: acl.name, blocks: rule.action === "BLOCK" ? 1 : 0 })));
+  const allRules = webACLs.flatMap(acl => acl.rules.map(rule => ({ ...rule, webAcl: acl.name, scope: acl.scope, blocks: rule.action === "BLOCK" ? 1 : 0 })));
+  const allow = webACLs.filter(a => a.defaultAction === "ALLOW").length;
+  const block = allRules.filter(r => r.action === "BLOCK").length;
+  const count = allRules.filter(r => r.action === "COUNT").length;
+  const challenge = allRules.filter(r => r.action === "MANAGED" || r.action === "CHALLENGE").length;
+  const captcha = allRules.filter(r => r.action === "CAPTCHA").length;
+
+  const ruleGroupMap = new Map();
+  for (const rule of allRules) {
+    if (!rule.ruleGroup) continue;
+    const existing = ruleGroupMap.get(rule.ruleGroup) || { name: rule.ruleGroup, ruleCount: 0, webACLs: new Set(), totalRules: 0 };
+    existing.ruleCount += 1;
+    existing.webACLs.add(rule.webAcl);
+    ruleGroupMap.set(rule.ruleGroup, existing);
+  }
+
+  const blockedRuleMap = new Map();
+  for (const rule of allRules) {
+    const key = `${rule.webAcl}/${rule.name}`;
+    blockedRuleMap.set(key, Math.max(1, rule.blocks));
+  }
+
+  const attackTypes = Array.from(blockedRuleMap.entries())
+    .sort((a,b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([rule, requests]) => ({ type: rule, requests }));
+
+  const managedRuleGroups = Array.from(ruleGroupMap.values()).map(group => ({
+    name: group.name,
+    ruleCount: group.ruleCount,
+    webACLs: Array.from(group.webACLs),
+  }));
+
   return {
-    allow: webACLs.filter(a => a.defaultAction === "ALLOW").length,
-    block: rules.filter(r => r.action === "BLOCK").length,
-    count: rules.filter(r => r.action === "COUNT").length,
-    challenge: rules.filter(r => r.action === "MANAGED").length,
-    captcha: 0,
-    configuredRules: rules.length,
+    allow,
+    block,
+    count,
+    challenge,
+    captcha,
+    totalTraffic: allow + block + count + challenge + captcha,
+    configuredRules: allRules.length,
     webACLs,
     topGeoIPs: [],
     topURIs: [],
-    blockedRules: rules.slice(0, 10).map(r => ({ rule: `${r.webAcl}/${r.name}`, blocks: Math.max(1, r.blocks) })),
+    blockedRules: allRules.slice(0, 10).map(r => ({ rule: `${r.webAcl}/${r.name}`, blocks: Math.max(1, r.blocks) })),
+    attackTypes,
+    managedRuleGroups,
   };
 }
 
@@ -273,19 +319,52 @@ async function getSecurityHubData(client) {
     nextToken = res.NextToken;
   } while (nextToken && findings.length < 300);
 
+  const standardsConfig = [];
+  try {
+    const [all, subs] = await Promise.all([
+      client.send(new ListStandardsCommand({})),
+      client.send(new ListStandardsSubscriptionsCommand({})),
+    ]);
+    const subMap = new Map((subs.StandardsSubscriptions || []).map(s => [s.StandardsArn, s.SubscriptionStatus]));
+    (all.Standards || []).forEach(std => {
+      standardsConfig.push({
+        arn: std.StandardsArn,
+        name: std.Name,
+        description: std.Description,
+        status: subMap.get(std.StandardsArn) || "DISABLED",
+      });
+    });
+  } catch (err) {
+    console.warn("SecurityHub standards metadata unavailable:", err.message);
+  }
+
   const counts = emptySeverity();
-  findings.forEach(f => counts[severityKey(f.Severity?.Label)]++);
+  const regions = new Map();
+  const findingItems = findings.map(f => {
+    const severity = severityKey(f.Severity?.Label);
+    const region = f.AwsRegion || f.Resources?.[0]?.Region || "global";
+    counts[severity]++;
+    regions.set(region, (regions.get(region) || 0) + 1);
+    return {
+      title: f.Title,
+      resource: f.Resources?.[0]?.Id || "-",
+      resourceType: f.Resources?.[0]?.Type || "-",
+      severity,
+      region,
+      compliance: f.Compliance?.Status || "-",
+      type: f.ProductArn?.split("/").pop() || f.ProductFields?.ProductName || "SecurityHub",
+    };
+  });
+
+  const findingsByRegion = Array.from(regions.entries()).map(([region, count]) => ({ region, count }));
   const weighted = counts.critical * 12 + counts.high * 6 + counts.medium * 3 + counts.low;
   return {
     score: Math.max(0, 100 - weighted),
     ...counts,
     trend: [],
-    findings: findings.slice(0, 25).map(f => ({
-      title: f.Title,
-      resource: f.Resources?.[0]?.Id || "-",
-      severity: severityKey(f.Severity?.Label),
-      compliance: f.Compliance?.Status || "-",
-    })),
+    standards: standardsConfig,
+    findingsByRegion,
+    findings: findingItems.slice(0, 25),
   };
 }
 
@@ -304,21 +383,51 @@ async function getGuardDutyData(client) {
       allFindings.push(...(res.Findings || []));
     }
   }
-  const high = allFindings.filter(f => f.Severity >= 7).length;
-  const medium = allFindings.filter(f => f.Severity >= 4 && f.Severity < 7).length;
-  const low = allFindings.filter(f => f.Severity < 4).length;
-  const byType = new Map();
-  allFindings.forEach(f => {
+  const typeCounts = new Map();
+  const resourceCounts = new Map();
+  const regionCounts = new Map();
+  const findingsList = allFindings.map(f => {
     const severity = f.Severity >= 7 ? "high" : f.Severity >= 4 ? "medium" : "low";
-    const current = byType.get(f.Type) || { type: f.Type, count: 0, severity };
-    current.count++;
-    byType.set(f.Type, current);
+    const type = f.Type || "Unknown";
+    const resource = f.Resources?.[0]?.ResourceType || f.Resources?.[0]?.InstanceDetails?.InstanceId || f.Resources?.[0]?.Id || "Unknown";
+    const region = f.Resources?.[0]?.Region || f.Region || "global";
+    typeCounts.set(type, (typeCounts.get(type) || 0) + 1);
+    resourceCounts.set(resource, (resourceCounts.get(resource) || 0) + 1);
+    regionCounts.set(region, (regionCounts.get(region) || 0) + 1);
+    return {
+      title: f.Title || f.Description || "GuardDuty Finding",
+      severity,
+      type,
+      resource,
+      region,
+    };
   });
-  return { findings: allFindings.length, high, medium, low, types: Array.from(byType.values()).slice(0, 20) };
+
+  const high = findingsList.filter(f => f.severity === "high").length;
+  const medium = findingsList.filter(f => f.severity === "medium").length;
+  const low = findingsList.filter(f => f.severity === "low").length;
+  const types = Array.from(typeCounts.entries())
+    .sort((a,b)=>b[1]-a[1])
+    .slice(0, 10)
+    .map(([type,count]) => ({ type, count, severity: "high" }));
+  const topResources = Array.from(resourceCounts.entries())
+    .sort((a,b)=>b[1]-a[1])
+    .slice(0, 10)
+    .map(([resource,count]) => ({ resource, count }));
+  return {
+    findings: findingsList.length,
+    high,
+    medium,
+    low,
+    types,
+    topResources,
+    findingsList: findingsList.slice(0, 50),
+    findingsByRegion: Array.from(regionCounts.entries()).map(([region,count]) => ({ region, count })),
+  };
 }
 
 async function getInspectorData(client) {
-  const findings = [];
+  const arns = [];
   let nextToken;
   do {
     const res = await client.send(new ListInspectorFindingsCommand({
@@ -326,21 +435,41 @@ async function getInspectorData(client) {
       nextToken,
       filterCriteria: { findingStatus: [{ comparison: "EQUALS", value: "ACTIVE" }] },
     }));
-    findings.push(...(res.findings || []));
+    arns.push(...(res.findings || []));
     nextToken = res.nextToken;
-  } while (nextToken && findings.length < 300);
+  } while (nextToken && arns.length < 300);
+
+  const findings = [];
+  if (arns.length) {
+    const res = await client.send(new BatchGetFindingsCommand({ findingArns: arns.slice(0, 100) }));
+    findings.push(...(res.findings || []));
+  }
 
   const counts = emptySeverity();
-  findings.forEach(f => counts[severityKey(f.severity)]++);
+  const resourceTypes = new Map();
+  const findingsList = findings.map(f => {
+    const severity = severityKey(f.severity);
+    const resource = f.resources?.[0]?.id || f.resourceId || "-";
+    const resourceType = f.resources?.[0]?.type || f.resourceType || "Unknown";
+    counts[severity]++;
+    resourceTypes.set(resourceType, (resourceTypes.get(resourceType) || 0) + 1);
+    return {
+      resource,
+      resourceType,
+      type: f.title || f.type || "-",
+      severity,
+      description: f.description || f.title || "Inspector finding",
+    };
+  });
+
   const weighted = counts.critical * 10 + counts.high * 5 + counts.medium * 2 + counts.low;
   return {
     score: Math.max(0, 100 - weighted),
     ...counts,
-    findings: findings.slice(0, 25).map(f => ({
-      resource: f.resources?.[0]?.id || "-",
-      type: f.title || f.type || "-",
-      severity: severityKey(f.severity),
-    })),
+    findings: findingsList.slice(0, 25),
+    findingsList,
+    criticalFindings: findingsList.filter(f => f.severity === "critical"),
+    resourceTypes: Array.from(resourceTypes.entries()).map(([resourceType,count]) => ({ resourceType, count })).sort((a,b)=>b.count-a.count).slice(0, 10),
   };
 }
 
@@ -384,7 +513,7 @@ export default async function handler(req, res) {
       safeCall("S3", () => getS3Inventory(s3Client, region), { total:0, public:0, private:0, buckets:[] }),
       safeCall("VPC", () => getVPCInventory(ec2Client), { total:0, vpcs:[] }),
       safeCall("ALB", () => getALBInventory(albClient), { total:0, loadBalancers:[] }),
-      safeCall("WAF", () => getWAFData(wafClient), { allow:0, block:0, count:0, challenge:0, captcha:0, configuredRules:0, webACLs:[], topGeoIPs:[], topURIs:[], blockedRules:[] }),
+      safeCall("WAF", () => getWAFData(wafClient), { allow:0, block:0, count:0, challenge:0, captcha:0, configuredRules:0, totalTraffic:0, webACLs:[], topGeoIPs:[], topURIs:[], blockedRules:[], attackTypes:[], managedRuleGroups:[] }),
       safeCall("Security Hub", () => getSecurityHubData(securityHubClient), { score:0, critical:0, high:0, medium:0, low:0, trend:[], findings:[] }),
       safeCall("GuardDuty", () => getGuardDutyData(guardDutyClient), { findings:0, high:0, medium:0, low:0, types:[] }),
       safeCall("Inspector", () => getInspectorData(inspectorClient), { score:0, critical:0, high:0, medium:0, low:0, findings:[] }),
