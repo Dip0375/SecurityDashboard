@@ -1368,7 +1368,7 @@ function Header({ accounts, selected, setSelected, section, timeRange, setTimeRa
 }
 
 // ─── Settings Section ─────────────────────────────────────────────────────────
-function SettingsSection({ currentUser, credentials, setCredentials, addToast }) {
+function SettingsSection({ currentUser, credentials, setCredentials, setCurrentUser, addToast }) {
   const [showChangePwd, setShowChangePwd] = useState(false);
   const [showNotif,     setShowNotif]     = useState(false);
   const cred = credentials.find(c=>c.email===currentUser.email) || {};
@@ -1513,11 +1513,6 @@ function SettingsSection({ currentUser, credentials, setCredentials, addToast })
             </div>
           </div>
         </div>
-      )}
-          style={{ marginTop:14, background:`${C.yellow}15`, border:`1px solid ${C.yellow}30`, borderRadius:8,
-            padding:"8px 16px", color:C.yellow, fontSize:12, fontWeight:700, cursor:"pointer" }}>
-          Manage Notification Settings
-        </button>
       </div>
 
       {showChangePwd && (
