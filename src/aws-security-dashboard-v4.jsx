@@ -1513,7 +1513,7 @@ function SettingsSection({ currentUser, credentials, setCredentials, setCurrentU
             </div>
           </div>
         </div>
-      </div>
+      )}
 
       {showChangePwd && (
         <ChangePasswordModal currentUser={currentUser} onClose={()=>setShowChangePwd(false)}
@@ -3162,7 +3162,7 @@ export default function App() {
             {section==="users"       && currentUser.role==="admin" && <UsersSection users={users} setUsers={setUsers} setCredentials={setCredentials} addToast={addToast} logEvent={logEvent}/>}
             {section==="accounts"    && currentUser.role==="admin" && <AccountsSection accounts={accounts} setAccounts={setAccounts} addToast={addToast} logEvent={logEvent}/>}
             {section==="auditlog"    && currentUser.role==="admin" && <AuditLogSection auditLog={auditLog}/>}
-            {section==="settings"    && <SettingsSection currentUser={currentUser} credentials={credentials} setCredentials={setCredentials} addToast={addToast}/>}
+            {section==="settings"    && <SettingsSection currentUser={currentUser} credentials={credentials} setCredentials={setCredentials} setCurrentUser={setCurrentUser} addToast={addToast}/>}
           </div>
         </div>
       </div>
