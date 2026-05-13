@@ -1161,6 +1161,7 @@ function LoginScreen({ onLogin, credentials }) {
               transform:"translateY(-50%)", background:"none", border:"none", color:C.textSec, cursor:"pointer" }}>
               {show ? <EyeOff size={15}/> : <Eye size={15}/>}
             </button>
+          </div>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginTop:6 }}>
             <button onClick={async () => {
               if (!email) { setErr("Please enter your email first."); return; }
