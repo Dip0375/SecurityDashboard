@@ -1,4 +1,4 @@
-import { getSupabaseClient } from "./supabaseClient.js";
+import { getSupabaseClient, encryptPayload } from "./supabaseClient.js";
 
 const TABLE = "aws_accounts";
 
@@ -21,26 +21,46 @@ export default async function handler(req, res) {
   }
 
   if (req.method === "POST") {
-    const { id, name, region, hasCredentials = true } = req.body || {};
-    if (!id || !name) return res.status(400).json({ error: "Account ID and Name are required." });
+    const { id, accountId, name, region, accessKeyId, secretAccessKey, hasCredentials = true } = req.body || {};
+    const finalId = id || accountId;
+
+    if (!finalId || !name) {
+      return res.status(400).json({ error: "Account ID and Name are required." });
+    }
 
     try {
-      const { data, error } = await supabase
+      // 1. Store/Update Account Metadata
+      const { data: accData, error: accErr } = await supabase
         .from(TABLE)
         .upsert({
-          id,
+          id: finalId,
           name,
           region,
-          has_credentials: hasCredentials,
+          has_credentials: !!(accessKeyId && secretAccessKey) || hasCredentials,
           updated_at: new Date().toISOString(),
         }, { onConflict: "id" })
         .select();
 
-      if (error) throw error;
-      return res.status(200).json(data?.[0]);
+      if (accErr) throw accErr;
+
+      // 2. If keys are provided, encrypt and store them
+      if (accessKeyId && secretAccessKey) {
+        const encrypted = encryptPayload({ accessKeyId, secretAccessKey, region });
+        const { error: credErr } = await supabase
+          .from("aws_account_credentials")
+          .upsert({
+            account_id: finalId,
+            encrypted_secret: encrypted,
+            created_at: new Date().toISOString()
+          }, { onConflict: "account_id" });
+
+        if (credErr) throw credErr;
+      }
+
+      return res.status(200).json(accData?.[0]);
     } catch (err) {
       console.error("[api/accounts] POST error:", err);
-      return res.status(500).json({ error: err.message || "Unable to save account metadata." });
+      return res.status(500).json({ error: err.message || "Unable to save account metadata or credentials." });
     }
   }
 

@@ -14,7 +14,7 @@ function normalizeEnvJson(raw) {
 
 function getDashboardCredentials() {
   const raw = normalizeEnvJson(
-    process.env.DASHBOARD_CREDENTIALS || process.env.VITE_DEFAULT_CREDENTIALS
+    process.env.DASHBOARD_CREDENTIALS || process.env.VITE_DASHBOARD_CREDENTIALS || process.env.VITE_DEFAULT_CREDENTIALS
   );
   if (!raw) return [];
 
