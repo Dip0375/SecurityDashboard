@@ -363,6 +363,7 @@ function accountFromInventory(account, inventory) {
       standards: inventory.securityHub.standards || account.securityHub.standards || [],
       findingsByRegion: inventory.securityHub.findingsByRegion || account.securityHub.findingsByRegion || [],
       findings: inventory.securityHub.findings || account.securityHub.findings || [],
+      mitreTactics: inventory.securityHub.mitreTactics || [],
     } : {
       ...account.securityHub,
       score,
@@ -374,6 +375,7 @@ function accountFromInventory(account, inventory) {
       standards: account.securityHub.standards || [],
       findingsByRegion: account.securityHub.findingsByRegion || [],
       findings: account.securityHub.findings || [],
+      mitreTactics: [],
     },
     guardDuty: inventory?.guardDuty ? {
       ...account.guardDuty,
@@ -445,13 +447,31 @@ function accountFromInventory(account, inventory) {
 function calcRisk(acc) {
   if (!acc) return 0;
   let s = 100;
-  s -= acc.securityHub.critical * 4;
-  s -= acc.securityHub.high * 1.5;
-  s -= acc.guardDuty.high * 3;
-  s -= acc.guardDuty.medium * 1;
-  s -= acc.inspector.critical * 2;
-  s -= acc.inspector.high * 0.5;
-  if (acc.waf.block / (acc.waf.allow + acc.waf.block) > 0.05) s -= 10;
+  
+  // Security Hub weighted impact
+  s -= (acc.securityHub.critical || 0) * 5;
+  s -= (acc.securityHub.high || 0) * 2;
+  s -= (acc.securityHub.medium || 0) * 0.5;
+
+  // GuardDuty weighted impact
+  s -= (acc.guardDuty.high || 0) * 4;
+  s -= (acc.guardDuty.medium || 0) * 1.5;
+
+  // Inspector weighted impact
+  s -= (acc.inspector.critical || 0) * 3;
+  s -= (acc.inspector.high || 0) * 1;
+
+  // Compliance Standards impact
+  const failedStandards = (acc.securityHub.standards || []).filter(std => std.failedChecks > 10).length;
+  s -= failedStandards * 5;
+
+  // WAF effectiveness
+  const totalWaf = (acc.waf.allow || 0) + (acc.waf.block || 0);
+  if (totalWaf > 0) {
+    const blockRate = (acc.waf.block || 0) / totalWaf;
+    if (blockRate > 0.2) s -= 10; // High attack volume
+  }
+
   return Math.max(0, Math.min(100, Math.round(s)));
 }
 function riskColor(score) { return score>=70?C.green:score>=50?C.yellow:C.red; }
@@ -970,6 +990,98 @@ function NotificationSettingsModal({ currentUser, credentials, setCredentials, o
   );
 }
 
+// ─── Executive Report Modal ───────────────────────────────────────────────────
+function ExecutiveReportModal({ accounts, onClose }) {
+  const print = () => window.print();
+  const date = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", zIndex:1000,
+      display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}>
+      <div style={{ background:"#fff", width:"100%", maxWidth:900, height:"90vh", borderRadius:16,
+        display:"flex", flexDirection:"column", overflow:"hidden", boxShadow:"0 24px 60px rgba(0,0,0,0.5)" }}>
+        
+        {/* Modal Header (Not printed) */}
+        <div className="no-print" style={{ padding:"16px 24px", background:"#f8fafc", borderBottom:"1px solid #e2e8f0",
+          display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+          <h2 style={{ margin:0, fontSize:18, fontWeight:800, color:"#1e293b" }}>Executive Security Report</h2>
+          <div style={{ display:"flex", gap:10 }}>
+            <button onClick={print} style={{ background:"#0ea5e9", color:"#fff", border:"none", borderRadius:8,
+              padding:"8px 16px", fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", gap:8 }}>
+              <Printer size={16}/> Print / Save PDF
+            </button>
+            <button onClick={onClose} style={{ background:"none", border:"1px solid #cbd5e1", borderRadius:8,
+              padding:"8px 16px", color:"#64748b", fontWeight:600, cursor:"pointer" }}>Close</button>
+          </div>
+        </div>
+
+        {/* Report Content */}
+        <div id="report-content" style={{ flex:1, overflowY:"auto", padding:48, color:"#1e293b", fontFamily:"serif" }}>
+          <style>{`
+            @media print {
+              .no-print { display: none !important; }
+              body { background: #fff !important; }
+              #report-content { padding: 0 !important; overflow: visible !important; height: auto !important; }
+            }
+          `}</style>
+
+          <div style={{ textAlign:"center", marginBottom:40 }}>
+            <h1 style={{ fontSize:32, fontWeight:900, margin:"0 0 8px", color:"#0f172a" }}>AWS Security Posture Report</h1>
+            <p style={{ fontSize:16, color:"#64748b", margin:0 }}>Generated on {date}</p>
+          </div>
+
+          <div style={{ marginBottom:32 }}>
+            <h2 style={{ fontSize:20, borderBottom:"2px solid #0ea5e9", paddingBottom:8, marginBottom:16 }}>1. Executive Summary</h2>
+            <p style={{ lineHeight:1.6 }}>
+              This report provides a high-level overview of the security posture across <strong>{accounts.length}</strong> AWS accounts. 
+              The assessment includes compliance standards, vulnerability scanning, threat detection, and edge protection metrics.
+            </p>
+          </div>
+
+          <div style={{ marginBottom:32 }}>
+            <h2 style={{ fontSize:20, borderBottom:"2px solid #0ea5e9", paddingBottom:8, marginBottom:20 }}>2. Multi-Account Risk Matrix</h2>
+            <table style={{ width:"100%", borderCollapse:"collapse" }}>
+              <thead>
+                <tr style={{ background:"#f1f5f9" }}>
+                  {["Account Name", "ID", "Risk Score", "Critical", "High", "WAF Blocks"].map(h => (
+                    <th key={h} style={{ textAlign:"left", padding:12, border:"1px solid #e2e8f0", fontSize:13 }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {accounts.map(acc => (
+                  <tr key={acc.id}>
+                    <td style={{ padding:12, border:"1px solid #e2e8f0", fontWeight:700 }}>{acc.name}</td>
+                    <td style={{ padding:12, border:"1px solid #e2e8f0", fontFamily:"monospace" }}>{acc.id}</td>
+                    <td style={{ padding:12, border:"1px solid #e2e8f0", fontWeight:800, color:calcRisk(acc) < 50 ? "#ef4444" : "#10b981" }}>{calcRisk(acc)}/100</td>
+                    <td style={{ padding:12, border:"1px solid #e2e8f0" }}>{acc.securityHub.critical + acc.inspector.critical}</td>
+                    <td style={{ padding:12, border:"1px solid #e2e8f0" }}>{acc.securityHub.high + acc.inspector.high}</td>
+                    <td style={{ padding:12, border:"1px solid #e2e8f0" }}>{acc.waf.block}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div>
+            <h2 style={{ fontSize:20, borderBottom:"2px solid #0ea5e9", paddingBottom:8, marginBottom:16 }}>3. Critical Recommendations</h2>
+            <ul style={{ lineHeight:1.8 }}>
+              {accounts.some(a => a.securityHub.critical > 0) && <li>Immediate remediation of Critical Security Hub findings (S3 Public Access, Root MFA).</li>}
+              {accounts.some(a => a.inspector.critical > 0) && <li>Patching of critical CVEs identified in EC2 and ECR instances.</li>}
+              {accounts.some(a => a.guardDuty.high > 0) && <li>Investigation of high-severity GuardDuty threat detections (Unauthorized Access, Malware).</li>}
+              <li>Review WAF rate-limiting rules to mitigate ongoing reconnaissance activities.</li>
+            </ul>
+          </div>
+
+          <div style={{ marginTop:60, paddingTop:20, borderTop:"1px solid #e2e8f0", fontSize:12, color:"#94a3b8", textAlign:"center" }}>
+            AWS SecureView Executive Report — Internal Use Only
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Login ─────────────────────────────────────────────────────────────────────
 function LoginScreen({ onLogin, credentials }) {
   const [email, setEmail]   = useState("");
@@ -1048,6 +1160,21 @@ function LoginScreen({ onLogin, credentials }) {
             <button onClick={()=>setShow(!show)} style={{ position:"absolute", right:12, top:"50%",
               transform:"translateY(-50%)", background:"none", border:"none", color:C.textSec, cursor:"pointer" }}>
               {show ? <EyeOff size={15}/> : <Eye size={15}/>}
+            </button>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginTop:6 }}>
+            <button onClick={async () => {
+              if (!email) { setErr("Please enter your email first."); return; }
+              try {
+                const res = await fetch("/api/password-reset", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ email })
+                });
+                if (res.ok) setErr("Reset link sent! Check your email.");
+                else setErr("Failed to send reset link.");
+              } catch (e) { setErr("Error requesting reset."); }
+            }} style={{ background:"none", border:"none", color:C.cyan, fontSize:12, cursor:"pointer", padding:0 }}>
+              Forgot Password?
             </button>
           </div>
           <button onClick={attempt} disabled={loading} style={{
@@ -1321,6 +1448,71 @@ function SettingsSection({ currentUser, credentials, setCredentials, addToast })
           ))}
         </div>
         <button onClick={()=>setShowNotif(true)}
+          style={{ background:"none", border:`1px solid ${C.border2}`, borderRadius:8,
+            padding:"10px", color:C.textSec, fontSize:12, fontWeight:700, cursor:"pointer", width:"100%", marginTop:12 }}>
+          Configure Notifications
+        </button>
+      </div>
+
+      {/* Global App Settings (Admin Only) */}
+      {currentUser.role === "admin" && (
+        <div style={card()}>
+          <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 16px", display:"flex", alignItems:"center", gap:8 }}>
+            <Settings size={14} color={C.cyan}/> Global App Settings
+          </h3>
+          <p style={{ color:C.textSec, fontSize:11, marginBottom:16 }}>Sensitive keys are encrypted before storage in Supabase.</p>
+          
+          <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+            <div>
+              <div style={{ color:C.textPri, fontSize:12, fontWeight:600, marginBottom:8 }}>Resend API Key</div>
+              <div style={{ display:"flex", gap:8 }}>
+                <input id="resend-key-input" type="password" placeholder="re_••••••••••••••••••••"
+                  style={{ flex:1, background:C.card2, border:`1px solid ${C.border2}`, borderRadius:8,
+                    padding:"8px 12px", color:C.textPri, fontSize:12, outline:"none" }}/>
+                <button onClick={async () => {
+                  const val = document.getElementById("resend-key-input").value;
+                  if (!val) return;
+                  try {
+                    const res = await fetch("/api/settings", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ key: "resend_api_key", value: val })
+                    });
+                    if (res.ok) { addToast("Resend API Key encrypted & saved", "success"); document.getElementById("resend-key-input").value = ""; }
+                    else addToast("Failed to save key", "error");
+                  } catch (e) { addToast("Error saving key", "error"); }
+                }} style={{ background:C.cyan, border:"none", borderRadius:8, padding:"8px 14px", color:C.bg, fontSize:12, fontWeight:700, cursor:"pointer" }}>
+                  Save
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <div style={{ color:C.textPri, fontSize:12, fontWeight:600, marginBottom:8 }}>Gmail App Password</div>
+              <div style={{ display:"flex", gap:8 }}>
+                <input id="gmail-key-input" type="password" placeholder="•••• •••• •••• ••••"
+                  style={{ flex:1, background:C.card2, border:`1px solid ${C.border2}`, borderRadius:8,
+                    padding:"8px 12px", color:C.textPri, fontSize:12, outline:"none" }}/>
+                <button onClick={async () => {
+                  const val = document.getElementById("gmail-key-input").value;
+                  if (!val) return;
+                  try {
+                    const res = await fetch("/api/settings", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ key: "gmail_pass", value: val })
+                    });
+                    if (res.ok) { addToast("Gmail App Password encrypted & saved", "success"); document.getElementById("gmail-key-input").value = ""; }
+                    else addToast("Failed to save password", "error");
+                  } catch (e) { addToast("Error saving password", "error"); }
+                }} style={{ background:C.cyan, border:"none", borderRadius:8, padding:"8px 14px", color:C.bg, fontSize:12, fontWeight:700, cursor:"pointer" }}>
+                  Save
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
           style={{ marginTop:14, background:`${C.yellow}15`, border:`1px solid ${C.yellow}30`, borderRadius:8,
             padding:"8px 16px", color:C.yellow, fontSize:12, fontWeight:700, cursor:"pointer" }}>
           Manage Notification Settings
@@ -1341,6 +1533,7 @@ function SettingsSection({ currentUser, credentials, setCredentials, addToast })
 
 // ─── Overview ─────────────────────────────────────────────────────────────────
 function OverviewSection({ accounts, setActive, setSelected }) {
+  const [showReport, setShowReport] = useState(false);
   const hasInventory = accounts.some(a => a.inventory);
   const totals = accounts.reduce((acc,a)=>({
     critical:acc.critical+a.securityHub.critical+a.inspector.critical,
@@ -1377,6 +1570,15 @@ function OverviewSection({ accounts, setActive, setSelected }) {
 
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+        <h2 style={{ color:C.textPri, fontSize:18, fontWeight:800, margin:0 }}>Executive Summary</h2>
+        <button onClick={() => setShowReport(true)}
+          style={{ display:"flex", alignItems:"center", gap:8, background:`${C.cyan}18`, border:`1px solid ${C.cyan}40`,
+            borderRadius:10, padding:"10px 16px", color:C.cyan, fontSize:13, fontWeight:700, cursor:"pointer" }}>
+          <FileText size={15}/>Generate Executive Report
+        </button>
+      </div>
+
       <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:14 }}>
         {hasInventory ? (
           <>
@@ -1394,6 +1596,8 @@ function OverviewSection({ accounts, setActive, setSelected }) {
           </>
         )}
       </div>
+
+      {showReport && <ExecutiveReportModal accounts={accounts} onClose={() => setShowReport(false)} />}
 
       <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:16 }}>
         {accounts.map(acc=>{
@@ -1685,18 +1889,27 @@ function SecurityHubSection({ account }) {
       <div style={card()}>
         <div style={{ display:"grid", gridTemplateColumns:"1.2fr 0.8fr", gap:18 }}>
           <div>
-            <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 10px" }}>Standards</h3>
+            <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 10px" }}>Standards & Compliance</h3>
             {sh.standards.length === 0 ? (
               <p style={{ color:C.textSec, fontSize:12, margin:0 }}>No Security Hub standards subscriptions detected.</p>
             ) : (
               <div style={{ display:"grid", gap:10 }}>
                 {sh.standards.map((std, i) => (
                   <div key={i} style={{ padding:12, borderRadius:10, background:C.card2, border:`1px solid ${C.border}` }}>
-                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:10 }}>
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:10, marginBottom:8 }}>
                       <div style={{ color:C.textPri, fontWeight:700, fontSize:13 }}>{std.name}</div>
-                      <Tag label={std.status.toLowerCase()} color={std.status === "ENABLED" ? C.green : C.textSec}/>
+                      <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                        <span style={{ fontSize:14, fontWeight:800, color:riskColor(std.score || 0) }}>{std.score || 0}%</span>
+                        <Tag label={std.status?.toLowerCase() || "unknown"} color={std.status === "ENABLED" ? C.green : C.textSec}/>
+                      </div>
                     </div>
-                    <div style={{ color:C.textSec, fontSize:11, marginTop:6 }}>{std.description || "No description available."}</div>
+                    <div style={{ height:4, background:C.bg, borderRadius:2, overflow:"hidden", marginBottom:6 }}>
+                      <div style={{ width:`${std.score || 0}%`, height:"100%", background:riskColor(std.score || 0), borderRadius:2 }}/>
+                    </div>
+                    <div style={{ color:C.textSec, fontSize:11, display:"flex", justifyContent:"space-between" }}>
+                      <span>{std.description?.slice(0, 80) || "No description available."}...</span>
+                      <span style={{ color:C.red, fontWeight:600 }}>{std.failedChecks || 0} Failed</span>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -1943,16 +2156,21 @@ function RiskSection({ account }) {
       </div>
     );
   }
+
   const risk = calcRisk(account);
   const scenarios = getScenarios(account);
+  const mitreData = account.securityHub.mitreTactics || [];
+
   const breakdown = [
     { label:"Security Hub Compliance", score:Math.round(account.securityHub.score), weight:30 },
     { label:"Inspector Vulnerability",  score:Math.round(account.inspector.score),  weight:30 },
     { label:"GuardDuty Threat Level",   score:Math.max(0,100-(account.guardDuty.high*8+account.guardDuty.medium*3)), weight:25 },
-    { label:"WAF Block Ratio",          score:Math.max(0,100-Math.round((account.waf.block/(account.waf.allow+account.waf.block))*200)), weight:15 },
+    { label:"WAF Block Ratio",          score:Math.max(0,100-Math.round((account.waf.block/((account.waf.allow+account.waf.block)||1))*200)), weight:15 },
   ];
+
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:18 }}>
+      {/* Risk Summary & Breakdown */}
       <div style={{ display:"grid", gridTemplateColumns:"1fr 2fr", gap:18 }}>
         <div style={{ ...card(), display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:16 }}>
           <ScoreRing score={risk} size={160} label="Risk"/>
@@ -1983,6 +2201,32 @@ function RiskSection({ account }) {
           ))}
         </div>
       </div>
+
+      {/* MITRE ATT&CK Heatmap */}
+      <div style={card()}>
+        <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 4px" }}>MITRE ATT&CK® Tactic Mapping</h3>
+        <p style={{ color:C.textSec, fontSize:12, margin:"0 0 16px" }}>Findings mapped to adversary tactics and techniques</p>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(140px, 1fr))", gap:10 }}>
+          {["Initial Access", "Execution", "Persistence", "Privilege Escalation", "Defense Evasion", "Credential Access", "Discovery", "Lateral Movement", "Collection", "Command and Control", "Exfiltration", "Impact"].map(tactic => {
+            const entry = mitreData.find(m => m.tactic === tactic);
+            const count = entry ? entry.count : 0;
+            const intensity = Math.min(1, count / 5);
+            return (
+              <div key={tactic} style={{
+                background: count > 0 ? `rgba(255, 59, 92, ${0.1 + intensity * 0.4})` : C.card2,
+                border: `1px solid ${count > 0 ? C.red : C.border2}`,
+                borderRadius: 10, padding: 12, display: "flex", flexDirection: "column", gap: 4,
+                transition: "transform 0.2s"
+              }}>
+                <div style={{ color: count > 0 ? C.textPri : C.textSec, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.03em" }}>{tactic}</div>
+                <div style={{ color: count > 0 ? C.red : C.textMut, fontSize: 18, fontWeight: 800 }}>{count}</div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Attack Scenarios */}
       <div style={card()}>
         <h3 style={{ color:C.textPri, fontSize:14, fontWeight:700, margin:"0 0 4px" }}>Possible Attack Scenarios</h3>
         <p style={{ color:C.textSec, fontSize:12, margin:"0 0 16px" }}>Based on active findings from GuardDuty, WAF, and security misconfigurations</p>
@@ -2024,66 +2268,45 @@ function UsersSection({ users, setUsers, setCredentials, addToast, logEvent }) {
     if (strength.passed < 4) { addToast("Password is too weak", "error"); return; }
 
     const newUser = { id:Date.now(), ...form, lastLogin:"Never" };
-    let emailSent = false;
     try {
-      const res = await fetch('/api/send-email', {
+      const res = await fetch("/api/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newUser)
+      });
+      if (!res.ok) throw new Error(await res.text());
+      
+      const savedUser = await res.json();
+      setUsers(u=>[...u, savedUser]);
+      
+      // Also send welcome email
+      fetch('/api/send-email', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           to: form.email,
           subject: 'Welcome to AWS SecureView Dashboard',
-          html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-            <h2 style="color: #00d4ff;">Welcome to AWS SecureView!</h2>
-            <p>Hi ${form.name},</p>
-            <p>Your account has been created successfully. You can now log in to the AWS Security Dashboard.</p>
-            <div style="background: #f5f5f5; padding: 15px; border-radius: 8px; margin: 20px 0;">
-              <strong>Login Details:</strong><br>
-              Email: ${form.email}<br>
-              Password: ${form.password}<br>
-              Role: ${form.role === 'admin' ? 'Administrator' : 'Viewer'}
-            </div>
-            <p><strong>Important:</strong> Please change your password after your first login.</p>
-            <p>If you have any questions, contact your system administrator.</p>
-            <p>Best regards,<br>AWS SecureView Team</p>
-          </div>
-        `,
-          text: `
-Welcome to AWS SecureView!
-
-Hi ${form.name},
-
-Your account has been created successfully. You can now log in to the AWS Security Dashboard.
-
-Login Details:
-Email: ${form.email}
-Password: ${form.password}
-Role: ${form.role === 'admin' ? 'Administrator' : 'Viewer'}
-
-Important: Please change your password after your first login.
-
-If you have any questions, contact your system administrator.
-
-Best regards,
-AWS SecureView Team
-        `
+          html: `<h2>Welcome ${form.name}!</h2><p>Your account has been created.</p><p>Password: ${form.password}</p>`
         })
-      });
-      emailSent = res.ok;
-      if (!res.ok) console.warn('Welcome email failed:', await res.text());
-    } catch(err) {
-      console.warn('Welcome email failed to send:', err);
-    }
+      }).catch(e => console.warn("Email failed", e));
 
-    setUsers(u=>[...u,newUser]);
-    setCredentials(prev=>[...prev,{
-      email:form.email, password:form.password, role:form.role, name:form.name,
-      notifyEmail:form.email, notificationsEnabled:true
-    }]);
-    logEvent("user_add", `Created ${form.role} user ${form.email}${emailSent ? " and sent welcome email" : "; welcome email not sent"}`, emailSent ? "success" : "warning");
-    addToast(emailSent ? `User ${form.name} created. Welcome email sent to ${form.email}` : `User ${form.name} created. Email provider is not configured or failed.`, emailSent ? "success" : "warning");
-    setForm({ name:"", email:"", role:"viewer", password:"" });
-    setShowAdd(false);
+      logEvent("user_add", `Created ${form.role} user ${form.email}`, "success");
+      addToast(`User ${form.name} created & saved to Supabase`, "success");
+      setForm({ name:"", email:"", role:"viewer", password:"" });
+      setShowAdd(false);
+    } catch (err) { addToast("Failed to save user: " + err.message, "error"); }
+  }
+
+  async function removeUser(user) {
+    if (!window.confirm(`Remove user ${user.name}?`)) return;
+    try {
+      const res = await fetch(`/api/users?email=${user.email}`, { method: "DELETE" });
+      if (res.ok) {
+        setUsers(prev => prev.filter(u => u.email !== user.email));
+        addToast("User removed from Supabase", "info");
+        logEvent("user_delete", `Removed user ${user.email}`, "warning");
+      }
+    } catch (e) { addToast("Failed to delete user", "error"); }
   }
 
   const inp = { background:C.card2, border:`1px solid ${C.border2}`, borderRadius:9,
@@ -2183,7 +2406,7 @@ AWS SecureView Team
                   </td>
                   <td style={{ padding:"12px 14px", color:C.textSec, fontFamily:"monospace", fontSize:11 }}>{u.lastLogin}</td>
                   <td style={{ padding:"12px 14px" }}>
-                    <button onClick={()=>{ setUsers(prev=>prev.filter(x=>x.id!==u.id)); setCredentials(prev=>prev.filter(x=>x.email!==u.email)); logEvent("user_delete", `Removed user ${u.email}`, "warning"); addToast(`User ${u.name} removed`, "info"); }}
+                    <button onClick={()=>removeUser(u)}
                       style={{ background:`${C.red}15`, border:`1px solid ${C.red}35`, borderRadius:7,
                         padding:"5px 10px", color:C.red, fontSize:11, cursor:"pointer",
                         display:"flex", alignItems:"center", gap:5, fontWeight:600 }}>
@@ -2220,13 +2443,14 @@ function AccountsSection({ accounts, setAccounts, addToast, logEvent }) {
     }
     setSaving(true);
     try {
-      // ── SECURE: encrypt & persist keys using AES-GCM (never stored in plain text) ──
-      await saveCredential(form.id, {
+      // ── SECURE: persist AWS keys to the backend API and Supabase, not localStorage ──
+      const savedAccount = await saveCredential(form.id, {
         accessKeyId:     form.accessKey,
         secretAccessKey: form.secretKey,
         region:          form.region,
+        name:            form.name,
       });
-      const baseAccount = { ...ACCOUNT_TEMPLATE, id:form.id, name:form.name, region:form.region };
+      const baseAccount = { ...ACCOUNT_TEMPLATE, id:form.id, name:form.name, region:form.region, hasCredentials:true };
       let nextAccount = baseAccount;
       try {
         const inventory = await fetchInventory(form.id, form.region);
@@ -2234,16 +2458,33 @@ function AccountsSection({ accounts, setAccounts, addToast, logEvent }) {
       } catch (fetchErr) {
         addToast(`Account saved, but live AWS fetch failed: ${fetchErr.message}`, "warning");
       }
-      setAccounts(prev=>[...prev,nextAccount]);
-      logEvent("account_add", `Onboarded AWS account ${form.name} (${form.id}) in ${form.region}`, "success");
-      addToast(`Account "${form.name}" onboarded — credentials encrypted & saved`, "success");
-      setForm({ id:"", name:"", region:"us-east-1", accessKey:"", secretKey:"" });
-      setShowAdd(false);
+      if (res.ok) {
+        const savedAccount = await res.json();
+        setAccounts(prev=>[...prev,{ ...ACCOUNT_TEMPLATE, ...savedAccount, hasCredentials:true }]);
+        logEvent("account_add", `Onboarded AWS account ${form.name} (${form.id}) in ${form.region}`, "success");
+        addToast(`Account "${form.name}" onboarded & persisted in Supabase`, "success");
+        setForm({ id:"", name:"", region:"us-east-1", accessKey:"", secretKey:"" });
+        setShowAdd(false);
+      } else {
+        throw new Error(await res.text());
+      }
     } catch(err) {
       addToast(`Failed to save credentials: ${err.message}`, "error");
     } finally {
       setSaving(false);
     }
+  }
+
+  async function removeAccount(id) {
+    if (!window.confirm("Are you sure you want to remove this account? Credentials will be deleted.")) return;
+    try {
+      const res = await fetch(`/api/accounts?id=${id}`, { method: "DELETE" });
+      if (res.ok) {
+        setAccounts(prev => prev.filter(a => a.id !== id));
+        addToast("Account removed from Supabase", "info");
+        logEvent("account_delete", `Removed AWS account ${id}`, "warning");
+      }
+    } catch (e) { addToast("Failed to delete account", "error"); }
   }
 
   const inp = { background:C.card2, border:`1px solid ${C.border2}`, borderRadius:9,
@@ -2343,11 +2584,14 @@ function AccountsSection({ accounts, setAccounts, addToast, logEvent }) {
       <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:14 }}>
         {accounts.map(acc=>{
           const risk = calcRisk(acc);
-          const hasCred = !!getCredential(acc.id);
+          const hasCred = acc.hasCredentials ?? !!getCredential(acc.id);
           return (
             <div key={acc.id} style={card()}>
               <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:14 }}>
                 <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                  <button onClick={() => removeAccount(acc.id)} style={{ background:"none", border:"none", color:C.textMut, cursor:"pointer", padding:4, display:"flex", alignItems:"center" }}>
+                    <Trash2 size={14}/>
+                  </button>
                   <div style={{ width:38, height:38, borderRadius:10, background:`${C.cyan}18`,
                     display:"flex", alignItems:"center", justifyContent:"center", border:`1px solid ${C.cyan}25` }}>
                     <Database size={18} color={C.cyan}/>
@@ -2358,7 +2602,7 @@ function AccountsSection({ accounts, setAccounts, addToast, logEvent }) {
                   </div>
                 </div>
                 <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:4 }}>
-                  <Tag label={risk>=70?"Healthy":risk>=50?"At Risk":"Critical"} color={riskColor(risk)}/>
+                  <Tag label={calcRisk(acc)>=70?"Healthy":calcRisk(acc)>=50?"At Risk":"Critical"} color={riskColor(calcRisk(acc))}/>
                   <div style={{ display:"flex", alignItems:"center", gap:4, fontSize:10, color:hasCred?C.green:C.yellow }}>
                     {hasCred ? <><Check size={10}/>Keys Secured</> : <><AlertCircle size={10}/>No Local Keys</>}
                   </div>
@@ -2759,6 +3003,38 @@ export default function App() {
       });
     }
   }, [currentUser?.email, currentUser?.password]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    async function loadBackendState() {
+      try {
+        const [accountsRes, usersRes, auditRes] = await Promise.all([
+          fetch("/api/accounts"),
+          fetch("/api/users"),
+          fetch("/api/audit"),
+        ]);
+
+        if (accountsRes.ok) {
+          const accountsData = await accountsRes.json();
+          setAccounts(accountsData.map(a => ({ ...ACCOUNT_TEMPLATE, ...a })));
+          if (!selectedAcc && accountsData[0]?.id) setSelectedAcc(accountsData[0].id);
+        }
+
+        if (usersRes.ok) {
+          const usersData = await usersRes.json();
+          setUsers(usersData);
+        }
+
+        if (auditRes.ok) {
+          const auditData = await auditRes.json();
+          setAuditLog(auditData);
+        }
+      } catch (err) {
+        console.warn("Could not load backend dashboard state:", err);
+      }
+    }
+    loadBackendState();
+  }, [currentUser]);
 
   useEffect(() => {
     if (!selectedAcc && accounts[0]?.id) setSelectedAcc(accounts[0].id);

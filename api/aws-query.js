@@ -42,6 +42,7 @@ import {
   GetBucketPolicyStatusCommand,
   GetBucketAclCommand,
 } from "@aws-sdk/client-s3";
+import { getSupabaseClient, decryptPayload } from "./supabaseClient.js";
 import {
   ElasticLoadBalancingV2Client,
   DescribeLoadBalancersCommand,
@@ -52,10 +53,13 @@ import {
   ListWebACLsCommand,
   GetWebACLCommand,
   ListResourcesForWebACLCommand,
+  GetSampledRequestsCommand,
 } from "@aws-sdk/client-wafv2";
 import {
   SecurityHubClient,
   GetFindingsCommand,
+  DescribeStandardsCommand,
+  GetEnabledStandardsCommand,
 } from "@aws-sdk/client-securityhub";
 import {
   GuardDutyClient,
@@ -67,10 +71,10 @@ import {
   Inspector2Client,
   ListFindingsCommand as ListInspectorFindingsCommand,
 } from "@aws-sdk/client-inspector2";
+import { getMitreDetails } from "./mitre-mapping.js";
 
 // ─── Resolve credentials from environment ────────────────────────────────────
-function resolveCredentials(accountId, requestCredential) {
-  const safe = accountId.replace(/\D/g, ""); // digits only
+async function resolveCredentials(accountId, requestCredential) {
   if (requestCredential?.accessKeyId && requestCredential?.secretAccessKey) {
     return {
       accessKeyId: requestCredential.accessKeyId,
@@ -79,14 +83,32 @@ function resolveCredentials(accountId, requestCredential) {
     };
   }
 
+  const safe = accountId.replace(/\D/g, ""); // digits only
   const accessKeyId     = process.env[`AWS_ACCOUNT_${safe}_ACCESS_KEY_ID`];
   const secretAccessKey = process.env[`AWS_ACCOUNT_${safe}_SECRET_ACCESS_KEY`];
   const region          = process.env[`AWS_ACCOUNT_${safe}_REGION`] || "us-east-1";
 
-  if (!accessKeyId || !secretAccessKey) {
-    return null; // account not configured server-side
+  if (accessKeyId && secretAccessKey) {
+    return { accessKeyId, secretAccessKey, region };
   }
-  return { accessKeyId, secretAccessKey, region };
+
+  try {
+    const supabase = getSupabaseClient();
+    const { data, error } = await supabase
+      .from("aws_account_credentials")
+      .select("encrypted_secret")
+      .eq("account_id", accountId)
+      .single();
+    if (error) {
+      if (error.code === "PGRST116") return null;
+      throw error;
+    }
+    if (!data?.encrypted_secret) return null;
+    return decryptPayload(data.encrypted_secret);
+  } catch (err) {
+    console.warn(`[aws-query] Could not resolve credentials from Supabase for ${accountId}:`, err.message || err);
+    return null;
+  }
 }
 
 // ─── EC2 inventory ────────────────────────────────────────────────────────────
@@ -283,6 +305,54 @@ async function getWAFData(client) {
     webACLs: Array.from(group.webACLs),
   }));
 
+  const geoMap = new Map();
+  const uriMap = new Map();
+  const terminatedRuleMap = new Map();
+
+  // Fetch sampled requests for each WebACL to get GeoIP and URI data
+  for (const acl of webACLs) {
+    try {
+      const timeWindow = {
+        StartTime: new Date(Date.now() - 3600000), // Last 1 hour
+        EndTime: new Date(),
+      };
+      const sampled = await client.send(new GetSampledRequestsCommand({
+        WebACLArn: acl.arn,
+        RuleMetricName: "Default_Action", // Sample from default action
+        Scope: acl.scope,
+        TimeWindow: timeWindow,
+        MaxItems: 100,
+      }));
+
+      for (const req of sampled.SampledRequests || []) {
+        const country = req.Request?.Country || "Unknown";
+        const uri = req.Request?.URI || "/";
+        const termRule = req.TerminatingRuleId || "Default";
+
+        geoMap.set(country, (geoMap.get(country) || 0) + 1);
+        uriMap.set(uri, (uriMap.get(uri) || 0) + 1);
+        terminatedRuleMap.set(termRule, (terminatedRuleMap.get(termRule) || 0) + 1);
+      }
+    } catch (e) {
+      console.warn(`[aws-query] WAF sampled requests failed for ${acl.name}:`, e.message);
+    }
+  }
+
+  const topGeoIPs = Array.from(geoMap.entries())
+    .sort((a,b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([country, requests]) => ({ country, requests }));
+
+  const topURIs = Array.from(uriMap.entries())
+    .sort((a,b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([uri, requests]) => ({ uri, requests }));
+
+  const blockedRules = Array.from(terminatedRuleMap.entries())
+    .sort((a,b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([rule, blocks]) => ({ rule, blocks }));
+
   return {
     allow,
     block,
@@ -292,9 +362,9 @@ async function getWAFData(client) {
     totalTraffic: allow + block + count + challenge + captcha,
     configuredRules: allRules.length,
     webACLs,
-    topGeoIPs: [],
-    topURIs: [],
-    blockedRules: allRules.slice(0, 10).map(r => ({ rule: `${r.webAcl}/${r.name}`, blocks: Math.max(1, r.blocks) })),
+    topGeoIPs,
+    topURIs,
+    blockedRules,
     attackTypes,
     managedRuleGroups,
   };
@@ -318,11 +388,17 @@ async function getSecurityHubData(client) {
 
   const counts = emptySeverity();
   const regions = new Map();
+  const tacticMap = new Map();
+
   const findingItems = findings.map(f => {
     const severity = severityKey(f.Severity?.Label);
     const region = f.AwsRegion || f.Resources?.[0]?.Region || "global";
     counts[severity]++;
     regions.set(region, (regions.get(region) || 0) + 1);
+
+    const mitre = getMitreDetails(f.GeneratorId || f.Title);
+    tacticMap.set(mitre.tactic, (tacticMap.get(mitre.tactic) || 0) + 1);
+
     return {
       title: f.Title,
       resource: f.Resources?.[0]?.Id || "-",
@@ -331,17 +407,40 @@ async function getSecurityHubData(client) {
       region,
       compliance: f.Compliance?.Status || "-",
       type: f.ProductArn?.split("/").pop() || f.ProductFields?.ProductName || "SecurityHub",
+      mitre,
     };
   });
 
+  // Fetch standards
+  let standards = [];
+  try {
+    const enabled = await client.send(new GetEnabledStandardsCommand({}));
+    standards = (enabled.StandardsSubscriptions || []).map(s => {
+      const standardFindings = findingItems.filter(f => f.title.includes(s.StandardsArn.split("/").pop()));
+      const failed = standardFindings.filter(f => f.compliance === "FAILED").length;
+      return {
+        name: s.StandardsArn.split("/").pop(),
+        arn: s.StandardsArn,
+        status: s.StandardsStatus,
+        failedChecks: failed,
+        score: Math.max(0, 100 - failed * 5),
+      };
+    });
+  } catch (e) {
+    console.warn("[aws-query] Security Hub standards failed:", e.message);
+  }
+
   const findingsByRegion = Array.from(regions.entries()).map(([region, count]) => ({ region, count }));
+  const mitreTactics = Array.from(tacticMap.entries()).map(([tactic, count]) => ({ tactic, count }));
   const weighted = counts.critical * 12 + counts.high * 6 + counts.medium * 3 + counts.low;
+
   return {
     score: Math.max(0, 100 - weighted),
     ...counts,
     trend: [],
-    standards: [],
+    standards,
     findingsByRegion,
+    mitreTactics,
     findings: findingItems.slice(0, 25),
   };
 }
@@ -457,12 +556,12 @@ export default async function handler(req, res) {
   const { accountId, region: requestedRegion, credential } = req.body || {};
   if (!accountId) return res.status(400).json({ error: "accountId is required" });
 
-  const creds = resolveCredentials(accountId, credential);
+  const creds = await resolveCredentials(accountId, credential);
   if (!creds) {
     return res.status(404).json({
       error: `No credentials configured server-side for account ${accountId}. ` +
              "Add AWS_ACCOUNT_<ID>_ACCESS_KEY_ID / _SECRET_ACCESS_KEY / _REGION " +
-             "in Vercel → Settings → Environment Variables.",
+             "in Vercel → Settings → Environment Variables, or store encrypted credentials in Supabase.",
     });
   }
 

@@ -1,3 +1,5 @@
+import { getSupabaseClient } from "./supabaseClient.js";
+
 function normalizeEnvJson(raw) {
   if (!raw) return null;
   const trimmed = raw.trim();
@@ -25,6 +27,23 @@ function getDashboardCredentials() {
   }
 }
 
+async function getUserFromDatabase(email) {
+  try {
+    const supabase = getSupabaseClient();
+    const { data, error } = await supabase
+      .from("dashboard_users")
+      .select("email,name,role,password,last_login")
+      .eq("email", email)
+      .limit(1)
+      .single();
+    if (error) throw error;
+    return data;
+  } catch (err) {
+    console.warn("[login] Supabase user lookup failed:", err.message || err);
+    return null;
+  }
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", process.env.ALLOWED_ORIGIN || "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
@@ -39,15 +58,24 @@ export default async function handler(req, res) {
   }
 
   const credentials = getDashboardCredentials();
-  if (credentials.length === 0) {
+  let user = await getUserFromDatabase(email);
+  if (user) {
+    if (user.password !== password) {
+      user = null;
+    }
+  }
+
+  if (!user && credentials.length === 0) {
     return res.status(503).json({
       error: "Dashboard login credentials are not configured in Vercel.",
     });
   }
 
-  const user = credentials.find(
-    (cred) => cred.email === email && cred.password === password
-  );
+  if (!user) {
+    user = credentials.find(
+      (cred) => cred.email === email && cred.password === password
+    );
+  }
 
   if (!user) {
     return res.status(401).json({ error: "Invalid email or password" });

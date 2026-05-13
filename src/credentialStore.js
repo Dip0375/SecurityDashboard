@@ -129,11 +129,23 @@ export async function initStore(passphrase) {
  */
 export async function saveCredential(accountId, cred) {
   if (!_sessionKey) throw new Error("Store not initialised — call initStore first");
-  // TODO: replace localStorage.setItem with a POST to your backend API
-  //       e.g. await fetch('/api/credentials', { method:'POST', body: JSON.stringify({accountId, ...cred}) })
-  //       The API should store the secret in AWS Secrets Manager / SSM Parameter Store.
-  const envelope = await encrypt(cred, _sessionKey);
-  localStorage.setItem(STORE_PREFIX + accountId, envelope);
+  const res = await fetch("/api/accounts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      accountId,
+      name: cred.name || accountId,
+      region: cred.region,
+      accessKeyId: cred.accessKeyId,
+      secretAccessKey: cred.secretAccessKey,
+    }),
+  });
+
+  if (!res.ok) {
+    const payload = await res.json().catch(() => ({}));
+    throw new Error(payload.error || "Unable to store AWS credentials.");
+  }
+
   _cache.set(accountId, cred);
 }
 

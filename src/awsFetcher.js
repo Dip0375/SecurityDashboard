@@ -124,16 +124,72 @@ function buildMockInventory(accountId) {
         { rule: "XSS", blocks: rng(30, 90) },
       ],
     },
+    securityHub: {
+      score: rng(40, 95),
+      critical: rng(0, 5),
+      high: rng(2, 10),
+      medium: rng(10, 30),
+      low: rng(40, 100),
+      standards: [
+        { name: "AWS Foundational Security Best Practices", score: rng(60, 90), failedChecks: rng(5, 15) },
+        { name: "CIS AWS Foundations Benchmark", score: rng(70, 95), failedChecks: rng(2, 8) },
+        { name: "PCI DSS v3.2.1", score: rng(50, 85), failedChecks: rng(10, 25) },
+      ],
+      mitreTactics: [
+        { tactic: "Initial Access", count: rng(1, 5) },
+        { tactic: "Discovery", count: rng(5, 15) },
+        { tactic: "Persistence", count: rng(1, 3) },
+        { tactic: "Privilege Escalation", count: rng(2, 6) },
+      ],
+      findings: Array.from({ length: 5 }).map((_, i) => ({
+        title: ["S3 Bucket Public Access","IAM Root User MFA Disabled","EC2 Security Group Open Port 22","RDS Snapshot Public","CloudTrail Disabled"][i],
+        severity: i === 0 ? "critical" : i < 3 ? "high" : "medium",
+        resource: `resource-${i}`,
+        compliance: "FAILED",
+      })),
+    },
+    guardDuty: {
+      findings: rng(5, 25),
+      high: rng(1, 5),
+      medium: rng(5, 10),
+      low: rng(10, 20),
+      types: [
+        { type: "UnauthorizedAccess:EC2/SSHBruteForce", count: rng(50, 200), severity: "high" },
+        { type: "Discovery:S3/MaliciousIPCaller", count: rng(10, 50), severity: "medium" },
+      ],
+      findingsList: Array.from({ length: 5 }).map((_, i) => ({
+        title: ["SSH Brute Force Attack","Cryptomining Activity","DNS Exfiltration","Tor Exit Node Traffic","IAM Role Assumption"][i],
+        severity: i === 0 ? "high" : "medium",
+        type: "T1078 - Valid Accounts",
+        resource: "i-0abc123",
+        region: "us-east-1",
+      })),
+    },
+    inspector: {
+      score: rng(50, 90),
+      critical: rng(0, 3),
+      high: rng(5, 15),
+      medium: rng(20, 50),
+      low: rng(50, 100),
+      findingsList: Array.from({ length: 5 }).map((_, i) => ({
+        resource: "i-0987654321",
+        resourceType: i % 2 === 0 ? "AWS::EC2::Instance" : "AWS::ECR::ContainerImage",
+        type: "CVE-2023-1234 - Buffer Overflow",
+        severity: i === 0 ? "critical" : "high",
+      })),
+    },
     fetchedAt: new Date().toISOString(),
   };
 }
 
 // ─── Real API call (Vercel serverless route) ──────────────────────────────────
 async function fetchFromAPI(accountId, region, credential) {
+  const body = { accountId, region, service: "inventory" };
+  if (credential) body.credential = credential;
   const res = await fetch("/api/aws-query", {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ accountId, region, service: "inventory", credential }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => res.statusText);
@@ -165,5 +221,5 @@ export async function fetchInventory(accountId, region) {
     await new Promise((r) => setTimeout(r, 600 + Math.random() * 800));
     return buildMockInventory(accountId);
   }
-  return fetchFromAPI(accountId, region, credential);
+  return fetchFromAPI(accountId, region, credential || undefined);
 }
