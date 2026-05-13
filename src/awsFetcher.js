@@ -25,7 +25,7 @@ import { getCredential } from "./credentialStore.js";
  * local development without real AWS accounts.
  */
 
-const MOCK = import.meta.env.VITE_MOCK_AWS !== "false"; // default to mock locally
+const MOCK = import.meta.env.VITE_MOCK_AWS === "true" || (import.meta.env.DEV && import.meta.env.VITE_MOCK_AWS !== "false");
 
 // ─── Mock inventory data (returned during local dev) ─────────────────────────
 function buildMockInventory(accountId) {

@@ -1437,7 +1437,7 @@ function Header({ accounts, selected, setSelected, section, timeRange, setTimeRa
                 background: C.card2, border: `1px solid ${C.border2}`, borderRadius: 8,
                 color: C.textPri, fontSize: 13, padding: "8px 12px", cursor: "pointer", outline: "none"
               }}>
-              {accounts.map(a => <option key={a.id} value={a.id}>{a.name} (…{a.id.slice(-4)})</option>)}
+              {accounts.filter(a => !a.deactivated).map(a => <option key={a.id} value={a.id}>{a.name} (…{a.id.slice(-4)})</option>)}
             </select>
             <div style={{
               display: "flex", alignItems: "center", gap: 6, background: C.card2,
@@ -2419,6 +2419,7 @@ function RiskSection({ account }) {
 function UsersSection({ users, setUsers, setCredentials, addToast, logEvent }) {
   if (!users) users = [];
   const [showAdd, setShowAdd] = useState(false);
+  const [editingUser, setEditingUser] = useState(null);
   const [form, setForm] = useState({ name: "", email: "", role: "viewer", password: "" });
   const [showPw, setShowPw] = useState(false);
   const strength = getPasswordStrength(form.password);
@@ -2468,6 +2469,22 @@ function UsersSection({ users, setUsers, setCredentials, addToast, logEvent }) {
         logEvent("user_delete", `Removed user ${user.email}`, "warning");
       }
     } catch (e) { addToast("Failed to delete user", "error"); }
+  }
+
+  async function updateUser() {
+    if (!editingUser.name || !editingUser.role) return;
+    try {
+      const res = await fetch("/api/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(editingUser)
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const saved = await res.json();
+      setUsers(prev => prev.map(u => u.email === saved.email ? saved : u));
+      addToast("User updated successfully", "success");
+      setEditingUser(null);
+    } catch (err) { addToast("Update failed: " + err.message, "error"); }
   }
 
   const inp = {
@@ -2581,19 +2598,63 @@ function UsersSection({ users, setUsers, setCredentials, addToast, logEvent }) {
                   </td>
                   <td style={{ padding: "12px 14px", color: C.textSec, fontFamily: "monospace", fontSize: 11 }}>{u.lastLogin}</td>
                   <td style={{ padding: "12px 14px" }}>
-                    <button onClick={() => removeUser(u)}
-                      style={{
-                        background: `${C.red}15`, border: `1px solid ${C.red}35`, borderRadius: 7,
-                        padding: "5px 10px", color: C.red, fontSize: 11, cursor: "pointer",
-                        display: "flex", alignItems: "center", gap: 5, fontWeight: 600
-                      }}>
-                      <Trash2 size={11} />Remove
-                    </button>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button onClick={() => setEditingUser(u)}
+                        style={{
+                          background: `${C.cyan}15`, border: `1px solid ${C.cyan}35`, borderRadius: 7,
+                          padding: "5px 10px", color: C.cyan, fontSize: 11, cursor: "pointer",
+                          display: "flex", alignItems: "center", gap: 5, fontWeight: 600
+                        }}>
+                        <Edit2 size={11} />Edit
+                      </button>
+                      <button onClick={() => removeUser(u)}
+                        style={{
+                          background: `${C.red}15`, border: `1px solid ${C.red}35`, borderRadius: 7,
+                          padding: "5px 10px", color: C.red, fontSize: 11, cursor: "pointer",
+                          display: "flex", alignItems: "center", gap: 5, fontWeight: 600
+                        }}>
+                        <Trash2 size={11} />Remove
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+      {editingUser && (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 3000, background: "rgba(0,0,0,0.7)",
+          backdropFilter: "blur(6px)", display: "flex", alignItems: "center", justifyContent: "center"
+        }}>
+          <div style={{ ...card(), width: 400 }}>
+            <h3 style={{ color: C.textPri, margin: "0 0 16px" }}>Edit User: {editingUser.email}</h3>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 20 }}>
+              <div>
+                <div style={{ color: C.textSec, fontSize: 11, marginBottom: 5 }}>Full Name</div>
+                <input style={inp} value={editingUser.name} onChange={e => setEditingUser({ ...editingUser, name: e.target.value })} />
+              </div>
+              <div>
+                <div style={{ color: C.textSec, fontSize: 11, marginBottom: 5 }}>Role</div>
+                <select style={inp} value={editingUser.role} onChange={e => setEditingUser({ ...editingUser, role: e.target.value })}>
+                  <option value="viewer">Viewer</option>
+                  <option value="admin">Administrator</option>
+                </select>
+              </div>
+              <div style={{ ...card2(), fontSize: 11, color: C.textSec, padding: 10 }}>
+                Email cannot be changed once a user is created.
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button onClick={updateUser} style={{
+                flex: 1, background: C.cyan, border: "none", borderRadius: 9, padding: 10, color: C.bg, fontWeight: 700, cursor: "pointer"
+              }}>Save Changes</button>
+              <button onClick={() => setEditingUser(null)} style={{
+                background: "none", border: `1px solid ${C.border2}`, borderRadius: 9, padding: "0 16px", color: C.textSec, cursor: "pointer"
+              }}>Cancel</button>
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -2776,16 +2837,37 @@ function AccountsSection({ accounts, setAccounts, addToast, logEvent }) {
             <div key={acc.id} style={card()}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <button onClick={() => removeAccount(acc.id)} style={{ background: "none", border: "none", color: C.textMut, cursor: "pointer", padding: 4, display: "flex", alignItems: "center" }}>
-                    <Trash2 size={14} />
-                  </button>
-                  <div style={{
-                    width: 38, height: 38, borderRadius: 10, background: `${C.cyan}18`,
-                    display: "flex", alignItems: "center", justifyContent: "center", border: `1px solid ${C.cyan}25`
-                  }}>
-                    <Database size={18} color={C.cyan} />
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    <button onClick={() => removeAccount(acc.id)}
+                      title="Remove Account"
+                      style={{
+                        background: `${C.red}15`, border: `1px solid ${C.red}40`,
+                        borderRadius: 6, padding: 6, color: C.red, cursor: "pointer", display: "flex"
+                      }}>
+                      <Trash2 size={13} />
+                    </button>
+                    <button onClick={() => {
+                      const next = accounts.map(a => a.id === acc.id ? { ...a, deactivated: !a.deactivated } : a);
+                      setAccounts(next);
+                      addToast(acc.deactivated ? "Account activated" : "Account deactivated", "info");
+                    }}
+                      title={acc.deactivated ? "Activate Sync" : "Deactivate Sync"}
+                      style={{
+                        background: acc.deactivated ? `${C.green}15` : `${C.textMut}20`,
+                        border: `1px solid ${acc.deactivated ? C.green : C.textMut}40`,
+                        borderRadius: 6, padding: 6, color: acc.deactivated ? C.green : C.textSec, cursor: "pointer", display: "flex"
+                      }}>
+                      {acc.deactivated ? <Activity size={13} /> : <EyeOff size={13} />}
+                    </button>
                   </div>
-                  <div>
+                  <div style={{
+                    width: 38, height: 38, borderRadius: 10, background: acc.deactivated ? `${C.textMut}10` : `${C.cyan}18`,
+                    display: "flex", alignItems: "center", justifyContent: "center", border: `1px solid ${acc.deactivated ? C.textMut : C.cyan}25`,
+                    opacity: acc.deactivated ? 0.5 : 1
+                  }}>
+                    <Database size={18} color={acc.deactivated ? C.textMut : C.cyan} />
+                  </div>
+                  <div style={{ opacity: acc.deactivated ? 0.5 : 1 }}>
                     <div style={{ color: C.textPri, fontWeight: 700, fontSize: 14 }}>{acc.name}</div>
                     <div style={{ color: C.textSec, fontSize: 11, fontFamily: "monospace" }}>{acc.id}</div>
                   </div>
@@ -2921,6 +3003,22 @@ function InventorySection({ account, refreshSignal, onInventoryLoaded }) {
             </table>
           </div>
         )}
+      </div>
+    );
+  }
+
+  if (account.deactivated) {
+    return (
+      <div style={{ ...card(), display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 300, gap: 16, textAlign: "center" }}>
+        <EyeOff size={40} color={C.textMut} />
+        <div>
+          <div style={{ color: C.textPri, fontWeight: 700, fontSize: 16 }}>Account Sync Deactivated</div>
+          <div style={{ color: C.textSec, fontSize: 13, marginTop: 4 }}>This account is currently deactivated and will not fetch new data from AWS.</div>
+        </div>
+        <button onClick={() => { /* This would be handled in Accounts section, so we just show info here */ }}
+          style={{ background: C.card2, border: `1px solid ${C.border2}`, borderRadius: 8, padding: "8px 20px", color: C.textSec, fontSize: 13 }}>
+          Re-activate in Accounts Section
+        </button>
       </div>
     );
   }
@@ -3258,9 +3356,10 @@ export default function App() {
   }, [currentUser]);
 
   useEffect(() => {
-    if (!selectedAcc && accounts[0]?.id) setSelectedAcc(accounts[0].id);
-    if (selectedAcc && accounts.length && !accounts.some(a => a.id === selectedAcc)) {
-      setSelectedAcc(accounts[0].id);
+    const activeAccounts = accounts.filter(a => !a.deactivated);
+    if (!selectedAcc && activeAccounts[0]?.id) setSelectedAcc(activeAccounts[0].id);
+    if (selectedAcc && accounts.length && !activeAccounts.some(a => a.id === selectedAcc)) {
+      setSelectedAcc(activeAccounts[0]?.id || accounts[0]?.id);
     }
   }, [accounts, selectedAcc, setSelectedAcc]);
 
