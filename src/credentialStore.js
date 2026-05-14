@@ -147,6 +147,7 @@ export async function saveCredential(accountId, cred) {
   }
 
   _cache.set(accountId, cred);
+  return await res.json();
 }
 
 /**
