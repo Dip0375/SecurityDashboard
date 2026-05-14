@@ -99,15 +99,26 @@ async function resolveCredentials(accountId, requestCredential) {
       .select("encrypted_secret")
       .eq("account_id", accountId)
       .single();
+    
     if (error) {
-      if (error.code === "PGRST116") return null;
-      throw error;
+      if (error.code === "PGRST116") {
+        throw new Error(`Credential record not found in Supabase for account ${accountId}. Please re-add the account with IAM keys.`);
+      }
+      throw new Error(`Supabase query error: ${error.message}`);
     }
-    if (!data?.encrypted_secret) return null;
-    return decryptPayload(data.encrypted_secret);
+    
+    if (!data?.encrypted_secret) {
+      throw new Error(`Credential record exists but contains no encrypted data for account ${accountId}.`);
+    }
+
+    try {
+      return decryptPayload(data.encrypted_secret);
+    } catch (decryptErr) {
+      throw new Error(`Decryption failed for account ${accountId}. Check if APP_ENCRYPTION_KEY is correct in Vercel. Original error: ${decryptErr.message}`);
+    }
   } catch (err) {
-    console.warn(`[aws-query] Could not resolve credentials from Supabase for ${accountId}:`, err.message || err);
-    return null;
+    console.error(`[aws-query] Credential resolution failed for ${accountId}:`, err.message);
+    throw err; 
   }
 }
 
@@ -556,12 +567,20 @@ export default async function handler(req, res) {
   const { accountId, region: requestedRegion, credential } = req.body || {};
   if (!accountId) return res.status(400).json({ error: "accountId is required" });
 
-  const creds = await resolveCredentials(accountId, credential);
+  let creds;
+  try {
+    creds = await resolveCredentials(accountId, credential);
+  } catch (err) {
+    return res.status(500).json({ 
+      error: `Credential Resolution Error: ${err.message}`,
+      hint: "Try deleting and re-adding the AWS account in the Accounts section."
+    });
+  }
+
   if (!creds) {
     return res.status(404).json({
-      error: `No credentials configured server-side for account ${accountId}. ` +
-             "Add AWS_ACCOUNT_<ID>_ACCESS_KEY_ID / _SECRET_ACCESS_KEY / _REGION " +
-             "in Vercel → Settings → Environment Variables, or store encrypted credentials in Supabase.",
+      error: `No credentials found for account ${accountId}.`,
+      hint: "Add AWS_ACCOUNT_<ID>_ACCESS_KEY_ID in Vercel or re-add the account in the dashboard."
     });
   }
 

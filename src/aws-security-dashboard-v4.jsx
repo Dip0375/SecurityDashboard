@@ -2688,24 +2688,23 @@ function AccountsSection({ accounts, setAccounts, addToast, logEvent }) {
         region: form.region,
         name: form.name,
       });
-      const baseAccount = { ...ACCOUNT_TEMPLATE, id: form.id, name: form.name, region: form.region, hasCredentials: true };
+
+      const baseAccount = { ...ACCOUNT_TEMPLATE, ...savedAccount, hasCredentials: true };
       let nextAccount = baseAccount;
+      
       try {
         const inventory = await fetchInventory(form.id, form.region);
         nextAccount = accountFromInventory(baseAccount, inventory);
       } catch (fetchErr) {
+        console.warn("Initial inventory fetch failed:", fetchErr);
         addToast(`Account saved, but live AWS fetch failed: ${fetchErr.message}`, "warning");
       }
-      if (res.ok) {
-        const savedAccount = await res.json();
-        setAccounts(prev => [...prev, { ...ACCOUNT_TEMPLATE, ...savedAccount, hasCredentials: true }]);
-        logEvent("account_add", `Onboarded AWS account ${form.name} (${form.id}) in ${form.region}`, "success");
-        addToast(`Account "${form.name}" onboarded & persisted in Supabase`, "success");
-        setForm({ id: "", name: "", region: "us-east-1", accessKey: "", secretKey: "" });
-        setShowAdd(false);
-      } else {
-        throw new Error(await res.text());
-      }
+
+      setAccounts(prev => [...prev, nextAccount]);
+      logEvent("account_add", `Onboarded AWS account ${form.name} (${form.id}) in ${form.region}`, "success");
+      addToast(`Account "${form.name}" onboarded & persisted in Supabase`, "success");
+      setForm({ id: "", name: "", region: "us-east-1", accessKey: "", secretKey: "" });
+      setShowAdd(false);
     } catch (err) {
       addToast(`Failed to save credentials: ${err.message}`, "error");
     } finally {

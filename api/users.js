@@ -23,19 +23,31 @@ export default async function handler(req, res) {
 
   if (req.method === "POST") {
     const { email, password, role = "viewer", name = "User" } = req.body || {};
-    if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required." });
+    if (!email) {
+      return res.status(400).json({ error: "Email is required." });
     }
+
     try {
       const now = new Date().toISOString();
-      const { error } = await supabase.from(TABLE).upsert({
+      const payload = {
         email,
-        password,
         role,
         name,
-        last_login: now,
-        created_at: now,
-      }, { onConflict: "email" });
+        updated_at: now,
+      };
+
+      // Only set/update password if provided (prevents overwriting with empty)
+      if (password) {
+        payload.password = password;
+      } else {
+        // If it's a new user and no password, we still need it
+        const { data: existing } = await supabase.from(TABLE).select("email").eq("email", email).single();
+        if (!existing && !password) {
+          return res.status(400).json({ error: "Password is required for new users." });
+        }
+      }
+
+      const { error } = await supabase.from(TABLE).upsert(payload, { onConflict: "email" });
       if (error) throw error;
 
       // Send Welcome Email
