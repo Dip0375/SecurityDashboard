@@ -1964,6 +1964,46 @@ function WAFSection({ account }) {
       </div>
 
       <div style={card()}>
+        <h3 style={{ color: C.textPri, fontSize: 14, fontWeight: 700, margin: "0 0 14px" }}>Web ACL Rules (Traffic Scenario)</h3>
+        {selectedACL && selectedACL.rules?.length > 0 ? (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+              <thead>
+                <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                  <th style={{ color: C.textSec, padding: "8px 12px", textAlign: "left" }}>Priority</th>
+                  <th style={{ color: C.textSec, padding: "8px 12px", textAlign: "left" }}>Rule Name</th>
+                  <th style={{ color: C.textSec, padding: "8px 12px", textAlign: "left" }}>Action</th>
+                  <th style={{ color: C.textSec, padding: "8px 12px", textAlign: "left" }}>Type</th>
+                </tr>
+              </thead>
+              <tbody>
+                {selectedACL.rules.map((rule, i) => (
+                  <tr key={i} style={{ borderBottom: `1px solid ${C.border}44` }}>
+                    <td style={{ padding: "10px 12px", color: C.textPri }}>{rule.priority}</td>
+                    <td style={{ padding: "10px 12px", color: C.textPri, fontWeight: 600 }}>{rule.name}</td>
+                    <td style={{ padding: "10px 12px" }}>
+                      <span style={{
+                        background: rule.action === "BLOCK" ? `${C.red}22` : rule.action === "ALLOW" ? `${C.green}22` : `${C.yellow}22`,
+                        color: rule.action === "BLOCK" ? C.red : rule.action === "ALLOW" ? C.green : C.yellow,
+                        padding: "2px 8px", borderRadius: 10, fontSize: 10, fontWeight: 700
+                      }}>
+                        {rule.action}
+                      </span>
+                    </td>
+                    <td style={{ padding: "10px 12px", color: C.textSec }}>
+                      {rule.ruleGroup ? `Managed (${rule.ruleGroup})` : "Custom"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p style={{ color: C.textSec, fontSize: 12, margin: 0 }}>No rules configured for this Web ACL.</p>
+        )}
+      </div>
+
+      <div style={card()}>
         <h3 style={{ color: C.textPri, fontSize: 14, fontWeight: 700, margin: "0 0 14px" }}>Managed Rule Groups</h3>
         {managedGroups.length === 0 ? (
           <p style={{ color: C.textSec, fontSize: 12, margin: 0 }}>No managed rule group data available.</p>

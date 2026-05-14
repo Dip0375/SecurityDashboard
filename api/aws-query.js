@@ -247,11 +247,17 @@ async function safeCall(label, fn, fallback) {
   }
 }
 
-async function getWAFData(client) {
+async function getWAFData(awsCreds) {
   const scopes = ["REGIONAL", "CLOUDFRONT"];
   const webACLs = [];
+  
+  // Regional client (uses the selected region)
+  const regionalClient = new WAFV2Client(awsCreds);
+  // Global client (CloudFront WAF is always in us-east-1)
+  const globalClient = new WAFV2Client({ ...awsCreds, region: "us-east-1" });
 
   for (const scope of scopes) {
+    const client = scope === "CLOUDFRONT" ? globalClient : regionalClient;
     try {
       const res = await client.send(new ListWebACLsCommand({ Scope: scope, Limit: 100 }));
       for (const acl of res.WebACLs || []) {
@@ -260,11 +266,19 @@ async function getWAFData(client) {
         try {
           const full = await client.send(new GetWebACLCommand({ Scope: scope, Name: acl.Name, Id: acl.Id }));
           detail = full.WebACL;
-        } catch { /* list data is still useful */ }
-        try {
-          const resources = await client.send(new ListResourcesForWebACLCommand({ WebACLArn: acl.ARN }));
-          attachedResources = resources.ResourceArns || [];
-        } catch { /* not all WebACLs will support resource listing */ }
+        } catch (e) {
+          console.warn(`[aws-query] Could not get details for WAF ${acl.Name}:`, e.message);
+        }
+        
+        if (scope === "REGIONAL") {
+          try {
+            const resources = await client.send(new ListResourcesForWebACLCommand({ WebACLArn: acl.ARN }));
+            attachedResources = resources.ResourceArns || [];
+          } catch (e) {
+            console.warn(`[aws-query] Could not list resources for WAF ${acl.Name}:`, e.message);
+          }
+        }
+        
         webACLs.push({
           name: acl.Name,
           id: acl.Id,
@@ -277,10 +291,14 @@ async function getWAFData(client) {
             priority: r.Priority,
             action: r.Action?.Allow ? "ALLOW" : r.Action?.Block ? "BLOCK" : r.Action?.Count ? "COUNT" : "MANAGED",
             ruleGroup: r.RuleGroupReference?.Name || null,
+            metricName: r.VisibilityConfig?.MetricName || r.Name,
           })),
+          defaultMetricName: detail?.VisibilityConfig?.MetricName || "Default_Action",
         });
       }
-    } catch { /* scope may be unavailable in this region */ }
+    } catch (e) {
+      console.warn(`[aws-query] WAF scope ${scope} failed:`, e.message);
+    }
   }
 
   const allRules = webACLs.flatMap(acl => acl.rules.map(rule => ({ ...rule, webAcl: acl.name, scope: acl.scope, blocks: rule.action === "BLOCK" ? 1 : 0 })));
@@ -322,30 +340,35 @@ async function getWAFData(client) {
 
   // Fetch sampled requests for each WebACL to get GeoIP and URI data
   for (const acl of webACLs) {
-    try {
-      const timeWindow = {
-        StartTime: new Date(Date.now() - 3600000), // Last 1 hour
-        EndTime: new Date(),
-      };
-      const sampled = await client.send(new GetSampledRequestsCommand({
-        WebACLArn: acl.arn,
-        RuleMetricName: "Default_Action", // Sample from default action
-        Scope: acl.scope,
-        TimeWindow: timeWindow,
-        MaxItems: 100,
-      }));
+    // We sample from the default action AND from each rule to get a full picture
+    const metricNames = [acl.defaultMetricName, ...(acl.rules || []).map(r => r.metricName)].filter(Boolean);
+    
+    for (const metricName of metricNames) {
+      try {
+        const timeWindow = {
+          StartTime: new Date(Date.now() - 3600000), // Last 1 hour
+          EndTime: new Date(),
+        };
+        const sampled = await client.send(new GetSampledRequestsCommand({
+          WebACLArn: acl.arn,
+          RuleMetricName: metricName,
+          Scope: acl.scope,
+          TimeWindow: timeWindow,
+          MaxItems: 100,
+        }));
 
-      for (const req of sampled.SampledRequests || []) {
-        const country = req.Request?.Country || "Unknown";
-        const uri = req.Request?.URI || "/";
-        const termRule = req.TerminatingRuleId || "Default";
+        for (const req of sampled.SampledRequests || []) {
+          const country = req.Request?.Country || "Unknown";
+          const uri = req.Request?.URI || "/";
+          const termRule = req.TerminatingRuleId || "Default";
 
-        geoMap.set(country, (geoMap.get(country) || 0) + 1);
-        uriMap.set(uri, (uriMap.get(uri) || 0) + 1);
-        terminatedRuleMap.set(termRule, (terminatedRuleMap.get(termRule) || 0) + 1);
+          geoMap.set(country, (geoMap.get(country) || 0) + 1);
+          uriMap.set(uri, (uriMap.get(uri) || 0) + 1);
+          terminatedRuleMap.set(termRule, (terminatedRuleMap.get(termRule) || 0) + 1);
+        }
+      } catch (e) {
+        // Many rules might not have sampled requests available
       }
-    } catch (e) {
-      console.warn(`[aws-query] WAF sampled requests failed for ${acl.name}:`, e.message);
     }
   }
 
@@ -452,7 +475,7 @@ async function getSecurityHubData(client) {
     standards,
     findingsByRegion,
     mitreTactics,
-    findings: findingItems.slice(0, 25),
+    findings: findingItems.slice(0, 100),
   };
 }
 
@@ -548,7 +571,7 @@ async function getInspectorData(client) {
   return {
     score: Math.max(0, 100 - weighted),
     ...counts,
-    findings: findingsList.slice(0, 25),
+    findings: findingsList.slice(0, 100),
     findingsList,
     criticalFindings: findingsList.filter(f => f.severity === "critical"),
     resourceTypes: Array.from(resourceTypes.entries()).map(([resourceType,count]) => ({ resourceType, count })).sort((a,b)=>b.count-a.count).slice(0, 10),
@@ -603,10 +626,10 @@ export default async function handler(req, res) {
       safeCall("S3", () => getS3Inventory(s3Client, region), { total:0, public:0, private:0, buckets:[] }),
       safeCall("VPC", () => getVPCInventory(ec2Client), { total:0, vpcs:[] }),
       safeCall("ALB", () => getALBInventory(albClient), { total:0, loadBalancers:[] }),
-      safeCall("WAF", () => getWAFData(wafClient), { allow:0, block:0, count:0, challenge:0, captcha:0, configuredRules:0, totalTraffic:0, webACLs:[], topGeoIPs:[], topURIs:[], blockedRules:[], attackTypes:[], managedRuleGroups:[] }),
-      safeCall("Security Hub", () => getSecurityHubData(securityHubClient), { score:0, critical:0, high:0, medium:0, low:0, trend:[], findings:[] }),
-      safeCall("GuardDuty", () => getGuardDutyData(guardDutyClient), { findings:0, high:0, medium:0, low:0, types:[] }),
-      safeCall("Inspector", () => getInspectorData(inspectorClient), { score:0, critical:0, high:0, medium:0, low:0, findings:[] }),
+      safeCall("WAF", () => getWAFData(awsCreds), { allow:0, block:0, count:0, challenge:0, captcha:0, configuredRules:0, totalTraffic:0, webACLs:[], topGeoIPs:[], topURIs:[], blockedRules:[], attackTypes:[], managedRuleGroups:[] }),
+      safeCall("Security Hub", () => getSecurityHubData(securityHubClient), { score:100, critical:0, high:0, medium:0, low:0, trend:[], findings:[] }),
+      safeCall("GuardDuty", () => getGuardDutyData(guardDutyClient), { findings:0, high:0, medium:0, low:0, types:[], findingsList:[], findingsByRegion:[], topResources:[] }),
+      safeCall("Inspector", () => getInspectorData(inspectorClient), { score:100, critical:0, high:0, medium:0, low:0, findings:[], findingsList:[], criticalFindings:[], resourceTypes:[] }),
     ]);
 
     return res.status(200).json({ ec2, eks, s3, vpc, alb, waf, securityHub, guardDuty, inspector, fetchedAt: new Date().toISOString() });
