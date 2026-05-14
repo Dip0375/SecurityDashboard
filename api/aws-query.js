@@ -620,6 +620,12 @@ export default async function handler(req, res) {
     const guardDutyClient = new GuardDutyClient(awsCreds);
     const inspectorClient = new Inspector2Client(awsCreds);
 
+    // Clients for Global/Fallback region (us-east-1)
+    const globalAwsCreds = { ...awsCreds, region: "us-east-1" };
+    const securityHubGlobal = region === "us-east-1" ? securityHubClient : new SecurityHubClient(globalAwsCreds);
+    const guardDutyGlobal   = region === "us-east-1" ? guardDutyClient : new GuardDutyClient(globalAwsCreds);
+    const inspectorGlobal   = region === "us-east-1" ? inspectorClient : new Inspector2Client(globalAwsCreds);
+
     const [ec2, eks, s3, vpc, alb, waf, securityHub, guardDuty, inspector] = await Promise.all([
       safeCall("EC2", () => getEC2Inventory(ec2Client), { total:0, running:0, stopped:0, instances:[] }),
       safeCall("EKS", () => getEKSInventory(eksClient), { total:0, clusters:[] }),
@@ -627,9 +633,31 @@ export default async function handler(req, res) {
       safeCall("VPC", () => getVPCInventory(ec2Client), { total:0, vpcs:[] }),
       safeCall("ALB", () => getALBInventory(albClient), { total:0, loadBalancers:[] }),
       safeCall("WAF", () => getWAFData(awsCreds), { allow:0, block:0, count:0, challenge:0, captcha:0, configuredRules:0, totalTraffic:0, webACLs:[], topGeoIPs:[], topURIs:[], blockedRules:[], attackTypes:[], managedRuleGroups:[] }),
-      safeCall("Security Hub", () => getSecurityHubData(securityHubClient), { score:100, critical:0, high:0, medium:0, low:0, trend:[], findings:[] }),
-      safeCall("GuardDuty", () => getGuardDutyData(guardDutyClient), { findings:0, high:0, medium:0, low:0, types:[], findingsList:[], findingsByRegion:[], topResources:[] }),
-      safeCall("Inspector", () => getInspectorData(inspectorClient), { score:100, critical:0, high:0, medium:0, low:0, findings:[], findingsList:[], criticalFindings:[], resourceTypes:[] }),
+      
+      // Multi-region aggregation for security findings
+      (async () => {
+        const [reg, glob] = await Promise.all([
+          safeCall("Security Hub", () => getSecurityHubData(securityHubClient), null),
+          region !== "us-east-1" ? safeCall("Security Hub Global", () => getSecurityHubData(securityHubGlobal), null) : Promise.resolve(null)
+        ]);
+        return aggregateSecurityHub(reg, glob);
+      })(),
+      
+      (async () => {
+        const [reg, glob] = await Promise.all([
+          safeCall("GuardDuty", () => getGuardDutyData(guardDutyClient), null),
+          region !== "us-east-1" ? safeCall("GuardDuty Global", () => getGuardDutyData(guardDutyGlobal), null) : Promise.resolve(null)
+        ]);
+        return aggregateGuardDuty(reg, glob);
+      })(),
+      
+      (async () => {
+        const [reg, glob] = await Promise.all([
+          safeCall("Inspector", () => getInspectorData(inspectorClient), null),
+          region !== "us-east-1" ? safeCall("Inspector Global", () => getInspectorData(inspectorGlobal), null) : Promise.resolve(null)
+        ]);
+        return aggregateInspector(reg, glob);
+      })(),
     ]);
 
     return res.status(200).json({ ec2, eks, s3, vpc, alb, waf, securityHub, guardDuty, inspector, fetchedAt: new Date().toISOString() });
@@ -637,4 +665,71 @@ export default async function handler(req, res) {
     console.error("[aws-query] Error:", err);
     return res.status(500).json({ error: err.message });
   }
+}
+
+// ─── Aggregation Helpers ───────────────────────────────────────────────────────
+
+function aggregateSecurityHub(reg, glob) {
+  const fallback = { score: 100, critical: 0, high: 0, medium: 0, low: 0, trend: [], findings: [], standards: [], findingsByRegion: [], mitreTactics: [] };
+  if (!reg && !glob) return fallback;
+  const r = reg || fallback;
+  const g = glob || fallback;
+  
+  const findings = [...(r.findings || []), ...(g.findings || [])].slice(0, 100);
+  const critical = (r.critical || 0) + (g.critical || 0);
+  const high = (r.high || 0) + (g.high || 0);
+  const medium = (r.medium || 0) + (g.medium || 0);
+  const low = (r.low || 0) + (g.low || 0);
+  
+  const weighted = critical * 12 + high * 6 + medium * 3 + low;
+  return {
+    ...r,
+    score: Math.max(0, 100 - weighted),
+    critical, high, medium, low,
+    findings,
+    standards: [...(r.standards || []), ...(g.standards || [])],
+    findingsByRegion: [...(r.findingsByRegion || []), ...(g.findingsByRegion || [])],
+    mitreTactics: [...(r.mitreTactics || []), ...(g.mitreTactics || [])],
+  };
+}
+
+function aggregateGuardDuty(reg, glob) {
+  const fallback = { findings: 0, high: 0, medium: 0, low: 0, types: [], findingsList: [], findingsByRegion: [], topResources: [] };
+  if (!reg && !glob) return fallback;
+  const r = reg || fallback;
+  const g = glob || fallback;
+
+  return {
+    findings: (r.findings || 0) + (g.findings || 0),
+    high: (r.high || 0) + (g.high || 0),
+    medium: (r.medium || 0) + (g.medium || 0),
+    low: (r.low || 0) + (g.low || 0),
+    types: [...(r.types || []), ...(g.types || [])].slice(0, 20),
+    findingsList: [...(r.findingsList || []), ...(g.findingsList || [])].slice(0, 100),
+    findingsByRegion: [...(r.findingsByRegion || []), ...(g.findingsByRegion || [])],
+    topResources: [...(r.topResources || []), ...(g.topResources || [])].slice(0, 20),
+  };
+}
+
+function aggregateInspector(reg, glob) {
+  const fallback = { score: 100, critical: 0, high: 0, medium: 0, low: 0, findings: [], findingsList: [], criticalFindings: [], resourceTypes: [] };
+  if (!reg && !glob) return fallback;
+  const r = reg || fallback;
+  const g = glob || fallback;
+
+  const critical = (r.critical || 0) + (g.critical || 0);
+  const high = (r.high || 0) + (g.high || 0);
+  const medium = (r.medium || 0) + (g.medium || 0);
+  const low = (r.low || 0) + (g.low || 0);
+  
+  const weighted = critical * 10 + high * 5 + medium * 2 + low;
+  return {
+    ...r,
+    score: Math.max(0, 100 - weighted),
+    critical, high, medium, low,
+    findings: [...(r.findings || []), ...(g.findings || [])].slice(0, 100),
+    findingsList: [...(r.findingsList || []), ...(g.findingsList || [])].slice(0, 100),
+    criticalFindings: [...(r.criticalFindings || []), ...(g.criticalFindings || [])],
+    resourceTypes: [...(r.resourceTypes || []), ...(g.resourceTypes || [])],
+  };
 }
