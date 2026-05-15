@@ -71,6 +71,10 @@ import {
   Inspector2Client,
   ListFindingsCommand as ListInspectorFindingsCommand,
 } from "@aws-sdk/client-inspector2";
+import {
+  CloudWatchClient,
+  GetMetricStatisticsCommand,
+} from "@aws-sdk/client-cloudwatch";
 import { getMitreDetails } from "./mitre-mapping.js";
 
 // ─── Resolve credentials from environment ────────────────────────────────────
@@ -399,14 +403,36 @@ async function getWAFData(awsCreds) {
     }
   }
 
-  // ── If sampled data has traffic, use it; otherwise fall back to rule counts ─
-  const hasSampledTraffic = (sampledAllow + sampledBlock + sampledCount + sampledChallenge + sampledCaptcha) > 0;
+  // ── Try CloudWatch metrics first (for exact sync with AWS WAF console) ─────
+  let allow, block, count, challenge, captcha;
+  let usingCloudWatchMetrics = false;
 
-  const allow     = hasSampledTraffic ? sampledAllow     : webACLs.filter(a => a.defaultAction === "ALLOW").length;
-  const block     = hasSampledTraffic ? sampledBlock     : allRules.filter(r => r.action === "BLOCK").length;
-  const count     = hasSampledTraffic ? sampledCount     : allRules.filter(r => r.action === "COUNT").length;
-  const challenge = hasSampledTraffic ? sampledChallenge : allRules.filter(r => r.action === "CHALLENGE").length;
-  const captcha   = hasSampledTraffic ? sampledCaptcha   : allRules.filter(r => r.action === "CAPTCHA").length;
+  try {
+    const cwMetrics = await getWAFCloudWatchMetrics(awsCreds, webACLs);
+    if (cwMetrics.totalTraffic > 0) {
+      allow = cwMetrics.allow;
+      block = cwMetrics.block;
+      count = cwMetrics.count;
+      challenge = cwMetrics.challenge;
+      captcha = cwMetrics.captcha;
+      usingCloudWatchMetrics = true;
+      console.log("[aws-query] Using exact CloudWatch metrics for WAF data");
+    }
+  } catch (e) {
+    console.warn("[aws-query] CloudWatch metrics fetch failed, falling back to sampled requests:", e.message);
+  }
+
+  // ── If CloudWatch metrics unavailable, use sampled data ───────────────────
+  if (!usingCloudWatchMetrics) {
+    // If sampled data has traffic, use it; otherwise fall back to rule counts ─
+    const hasSampledTraffic = (sampledAllow + sampledBlock + sampledCount + sampledChallenge + sampledCaptcha) > 0;
+
+    allow     = hasSampledTraffic ? sampledAllow     : webACLs.filter(a => a.defaultAction === "ALLOW").length;
+    block     = hasSampledTraffic ? sampledBlock     : allRules.filter(r => r.action === "BLOCK").length;
+    count     = hasSampledTraffic ? sampledCount     : allRules.filter(r => r.action === "COUNT").length;
+    challenge = hasSampledTraffic ? sampledChallenge : allRules.filter(r => r.action === "CHALLENGE").length;
+    captcha   = hasSampledTraffic ? sampledCaptcha   : allRules.filter(r => r.action === "CAPTCHA").length;
+  }
 
   // ── Top Geo IPs ────────────────────────────────────────────────────────────
   const topGeoIPs = Array.from(geoMap.entries())
@@ -446,7 +472,74 @@ async function getWAFData(awsCreds) {
     blockedRules,
     attackTypes,
     managedRuleGroups,
-    sampledFromRealTraffic: hasSampledTraffic,
+    metricsSource: usingCloudWatchMetrics ? "CloudWatch" : "SampledRequests",
+    usingCloudWatchMetrics,
+  };
+}
+
+// ─── Fetch WAF metrics from CloudWatch (for exact data sync) ──────────────────
+async function getWAFCloudWatchMetrics(awsCreds, webACLs) {
+  const cwClient = new CloudWatchClient(awsCreds);
+  
+  let totalAllow = 0;
+  let totalBlock = 0;
+  let totalCount = 0;
+  let totalChallenge = 0;
+  let totalCaptcha = 0;
+
+  // Time window: Last 24 hours
+  const endTime = new Date();
+  const startTime = new Date(endTime.getTime() - 24 * 60 * 60 * 1000);
+
+  for (const acl of webACLs) {
+    const metricQueries = [
+      { name: 'AllowedRequests', stat: 'Sum' },
+      { name: 'BlockedRequests', stat: 'Sum' },
+      { name: 'CountedRequests', stat: 'Sum' },
+      { name: 'ChallengeRequests', stat: 'Sum' },
+      { name: 'CaptchaRequests', stat: 'Sum' },
+    ];
+
+    for (const metric of metricQueries) {
+      try {
+        const params = {
+          Namespace: 'AWS/WAFV2',
+          MetricName: metric.name,
+          Dimensions: [
+            { Name: 'WebACL', Value: acl.name },
+            { Name: 'Region', Value: acl.scope },
+            { Name: 'Rule', Value: 'ALL' },
+          ],
+          StartTime: startTime,
+          EndTime: endTime,
+          Period: 3600, // 1 hour
+          Statistics: [metric.stat],
+        };
+
+        const result = await cwClient.send(new GetMetricStatisticsCommand(params));
+        const dataPoints = result.Datapoints || [];
+        const sum = dataPoints.reduce((acc, dp) => acc + (dp.Sum || 0), 0);
+
+        if (metric.name === 'AllowedRequests') totalAllow += sum;
+        else if (metric.name === 'BlockedRequests') totalBlock += sum;
+        else if (metric.name === 'CountedRequests') totalCount += sum;
+        else if (metric.name === 'ChallengeRequests') totalChallenge += sum;
+        else if (metric.name === 'CaptchaRequests') totalCaptcha += sum;
+      } catch (e) {
+        // Silently skip if metric doesn't exist
+        console.warn(`[aws-query] Could not fetch CloudWatch metric ${metric.name} for WAF ${acl.name}:`, e.message);
+      }
+    }
+  }
+
+  return {
+    allow: totalAllow,
+    block: totalBlock,
+    count: totalCount,
+    challenge: totalChallenge,
+    captcha: totalCaptcha,
+    totalTraffic: totalAllow + totalBlock + totalCount + totalChallenge + totalCaptcha,
+    isFromCloudWatch: true,
   };
 }
 
