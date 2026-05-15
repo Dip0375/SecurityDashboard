@@ -9,9 +9,9 @@ import {
   XCircle, Plus, Trash2, RefreshCw, Zap, Database, User, Key,
   ChevronLeft, ChevronRight, TrendingUp, Layers, Settings, Bell,
   Calendar, Clock, ChevronDown, X, FileText, Search, Filter,
-  Download, LogIn, UserPlus, UserMinus, Edit2, Shield as ShieldIcon,
-  AlertCircle, Info, Mail, EyeOff, Lock as LockIcon, Check, BellRing,
-  Box, HardDrive, Boxes, Network, GitBranch, Cpu, Package
+  Download, LogIn, UserPlus, UserMinus, Edit2,
+  AlertCircle, Info, Mail, EyeOff, Check, BellRing,
+  Box, HardDrive, Boxes, Network, GitBranch, Cpu, Package, Printer
 } from "lucide-react";
 import { saveCredential, initStore, getCredential } from "./credentialStore.js";
 import { fetchInventory } from "./awsFetcher.js";
@@ -763,6 +763,13 @@ function ChangePasswordModal({ currentUser, onClose, credentials, setCredentials
     ));
     setCurrentUser(prev => prev ? { ...prev, password: newPass } : prev);
 
+    // Persist new password to backend
+    fetch("/api/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: currentUser.email, password: newPass }),
+    }).catch(err => console.warn("[ChangePassword] Backend persist failed:", err));
+
     fetch('/api/send-email', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -942,6 +949,23 @@ function NotificationSettingsModal({ currentUser, credentials, setCredentials, o
         }
         : c
     ));
+
+    // Persist notification preferences to backend
+    fetch("/api/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: currentUser.email,
+        notifyEmail,
+        notificationsEnabled: enabled,
+        notify_failed_login: events.failed_login,
+        notify_new_login: events.new_login,
+        notify_password_change: events.password_change,
+        notify_user_add: events.user_add,
+        notify_critical_alert: events.critical_alert,
+      }),
+    }).catch(err => console.warn("[NotifSettings] Backend persist failed:", err));
+
     addToast(`Notification preferences saved. Alerts will go to ${notifyEmail}`, "success");
     onClose();
   }
@@ -1405,8 +1429,7 @@ function Sidebar({ active, setActive, role, user, onLogout, onChangePassword, on
 }
 
 // ─── Header ───────────────────────────────────────────────────────────────────
-function Header({ accounts, selected, setSelected, section, timeRange, setTimeRange, currentUser, onChangePassword, onNotifSettings, onRefresh, refreshing }) {
-  const acc = accounts.find(a => a.id === selected) || accounts[0];
+function Header({ accounts, selected, setSelected, section, timeRange, setTimeRange, currentUser, onChangePassword, onNotifSettings, onRefresh, refreshing }) {  const acc = accounts.find(a => a.id === selected) || accounts[0];
   const risk = calcRisk(acc);
   const navItem = NAV.find(n => n.id === section);
 
@@ -2951,16 +2974,9 @@ function InventorySection({ account, refreshSignal, onInventoryLoaded }) {
   const [error, setError] = useState(null);
   const [lastFetched, setLastFetched] = useState(null);
 
-  if (!account) {
-    return (
-      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 400, gap: 16 }}>
-        <Database size={40} color={C.textMut} />
-        <p style={{ color: C.textSec, fontSize: 14 }}>Select an AWS account to view inventory</p>
-      </div>
-    );
-  }
-
+  // Hooks must be called unconditionally — early return moved below all hooks
   const load = useCallback(async () => {
+    if (!account) return;
     setLoading(true); setError(null);
     try {
       const inv = await fetchInventory(account.id, account.region);
@@ -2975,6 +2991,16 @@ function InventorySection({ account, refreshSignal, onInventoryLoaded }) {
   }, [account.id, account.region]);
 
   useEffect(() => { load(); }, [load, refreshSignal]);
+
+  // Early return after all hooks
+  if (!account) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 400, gap: 16 }}>
+        <Database size={40} color={C.textMut} />
+        <p style={{ color: C.textSec, fontSize: 14 }}>Select an AWS account to view inventory</p>
+      </div>
+    );
+  }
 
   const sectionIcon = (Icon, color) => (
     <div style={{
@@ -3404,7 +3430,9 @@ export default function App() {
 
   const scaledAccounts = useMemo(() => {
     const factor = getScaleFactor(timeRange);
-    return accounts.map(a => scaleAccount(a, factor));
+    // Only scale accounts that have no real inventory (mock/fallback data).
+    // Real AWS data (accounts with inventory fetched from AWS) should not be scaled.
+    return accounts.map(a => a.inventory ? a : scaleAccount(a, factor));
   }, [accounts, timeRange]);
 
   const account = useMemo(
@@ -3515,6 +3543,8 @@ export default function App() {
             currentUser={currentUser}
             onChangePassword={() => setShowChangePwd(true)}
             onNotifSettings={() => setShowNotif(true)}
+            onRefresh={refreshCurrentPage}
+            refreshing={refreshingPage}
           />
           <div key={`${section}-${refreshSignal}`} style={{ flex: 1, padding: 22, overflowY: "auto" }}>
             {section === "overview" && <OverviewSection accounts={scaledAccounts} setActive={setSection} setSelected={setSelectedAcc} />}

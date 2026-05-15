@@ -22,7 +22,12 @@ export default async function handler(req, res) {
   }
 
   if (req.method === "POST") {
-    const { email, password, role = "viewer", name = "User" } = req.body || {};
+    const {
+      email, password, role = "viewer", name = "User",
+      notifyEmail, notificationsEnabled,
+      notify_failed_login, notify_new_login, notify_password_change,
+      notify_user_add, notify_critical_alert,
+    } = req.body || {};
     if (!email) {
       return res.status(400).json({ error: "Email is required." });
     }
@@ -35,6 +40,15 @@ export default async function handler(req, res) {
         name,
         updated_at: now,
       };
+
+      // Persist notification preferences if provided
+      if (notifyEmail !== undefined) payload.notify_email = notifyEmail;
+      if (notificationsEnabled !== undefined) payload.notifications_enabled = notificationsEnabled;
+      if (notify_failed_login !== undefined) payload.notify_failed_login = notify_failed_login;
+      if (notify_new_login !== undefined) payload.notify_new_login = notify_new_login;
+      if (notify_password_change !== undefined) payload.notify_password_change = notify_password_change;
+      if (notify_user_add !== undefined) payload.notify_user_add = notify_user_add;
+      if (notify_critical_alert !== undefined) payload.notify_critical_alert = notify_critical_alert;
 
       // Only set/update password if provided (prevents overwriting with empty)
       if (password) {

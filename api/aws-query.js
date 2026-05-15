@@ -340,6 +340,8 @@ async function getWAFData(awsCreds) {
 
   // Fetch sampled requests for each WebACL to get GeoIP and URI data
   for (const acl of webACLs) {
+    // Pick the correct client based on the ACL's scope
+    const aclClient = acl.scope === "CLOUDFRONT" ? globalClient : regionalClient;
     // We sample from the default action AND from each rule to get a full picture
     const metricNames = [acl.defaultMetricName, ...(acl.rules || []).map(r => r.metricName)].filter(Boolean);
     
@@ -349,7 +351,7 @@ async function getWAFData(awsCreds) {
           StartTime: new Date(Date.now() - 3600000), // Last 1 hour
           EndTime: new Date(),
         };
-        const sampled = await client.send(new GetSampledRequestsCommand({
+        const sampled = await aclClient.send(new GetSampledRequestsCommand({
           WebACLArn: acl.arn,
           RuleMetricName: metricName,
           Scope: acl.scope,
