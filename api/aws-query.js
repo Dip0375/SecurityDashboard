@@ -247,10 +247,22 @@ async function safeCall(label, fn, fallback) {
   }
 }
 
+// ─── Map AWS WAF rule action to a display action string ───────────────────────
+function resolveRuleAction(r) {
+  if (r.Action?.Allow)     return "ALLOW";
+  if (r.Action?.Block)     return "BLOCK";
+  if (r.Action?.Count)     return "COUNT";
+  if (r.Action?.Captcha)   return "CAPTCHA";
+  if (r.Action?.Challenge) return "CHALLENGE";
+  // Rule group references and managed rules have no direct Action — they use OverrideAction
+  if (r.OverrideAction?.None || r.OverrideAction?.Count) return r.OverrideAction?.Count ? "COUNT" : "MANAGED";
+  return "MANAGED";
+}
+
 async function getWAFData(awsCreds) {
   const scopes = ["REGIONAL", "CLOUDFRONT"];
   const webACLs = [];
-  
+
   // Regional client (uses the selected region)
   const regionalClient = new WAFV2Client(awsCreds);
   // Global client (CloudFront WAF is always in us-east-1)
@@ -269,7 +281,7 @@ async function getWAFData(awsCreds) {
         } catch (e) {
           console.warn(`[aws-query] Could not get details for WAF ${acl.Name}:`, e.message);
         }
-        
+
         if (scope === "REGIONAL") {
           try {
             const resources = await client.send(new ListResourcesForWebACLCommand({ WebACLArn: acl.ARN }));
@@ -278,7 +290,7 @@ async function getWAFData(awsCreds) {
             console.warn(`[aws-query] Could not list resources for WAF ${acl.Name}:`, e.message);
           }
         }
-        
+
         webACLs.push({
           name: acl.Name,
           id: acl.Id,
@@ -289,11 +301,14 @@ async function getWAFData(awsCreds) {
           rules: (detail?.Rules || []).map(r => ({
             name: r.Name,
             priority: r.Priority,
-            action: r.Action?.Allow ? "ALLOW" : r.Action?.Block ? "BLOCK" : r.Action?.Count ? "COUNT" : "MANAGED",
-            ruleGroup: r.RuleGroupReference?.Name || null,
+            action: resolveRuleAction(r),
+            ruleGroup: r.Statement?.RuleGroupReferenceStatement?.ARN?.split("/").pop()
+              || r.Statement?.ManagedRuleGroupStatement?.Name
+              || null,
             metricName: r.VisibilityConfig?.MetricName || r.Name,
           })),
-          defaultMetricName: detail?.VisibilityConfig?.MetricName || "Default_Action",
+          // The WebACL-level metric is the best source for ALL traffic sampling
+          defaultMetricName: detail?.VisibilityConfig?.MetricName || acl.Name,
         });
       }
     } catch (e) {
@@ -301,32 +316,19 @@ async function getWAFData(awsCreds) {
     }
   }
 
-  const allRules = webACLs.flatMap(acl => acl.rules.map(rule => ({ ...rule, webAcl: acl.name, scope: acl.scope, blocks: rule.action === "BLOCK" ? 1 : 0 })));
-  const allow = webACLs.filter(a => a.defaultAction === "ALLOW").length;
-  const block = allRules.filter(r => r.action === "BLOCK").length;
-  const count = allRules.filter(r => r.action === "COUNT").length;
-  const challenge = allRules.filter(r => r.action === "MANAGED" || r.action === "CHALLENGE").length;
-  const captcha = allRules.filter(r => r.action === "CAPTCHA").length;
+  // ── Build rule group map for "Managed Rule Groups" panel ──────────────────
+  const allRules = webACLs.flatMap(acl =>
+    acl.rules.map(rule => ({ ...rule, webAcl: acl.name, scope: acl.scope }))
+  );
 
   const ruleGroupMap = new Map();
   for (const rule of allRules) {
     if (!rule.ruleGroup) continue;
-    const existing = ruleGroupMap.get(rule.ruleGroup) || { name: rule.ruleGroup, ruleCount: 0, webACLs: new Set(), totalRules: 0 };
+    const existing = ruleGroupMap.get(rule.ruleGroup) || { name: rule.ruleGroup, ruleCount: 0, webACLs: new Set() };
     existing.ruleCount += 1;
     existing.webACLs.add(rule.webAcl);
     ruleGroupMap.set(rule.ruleGroup, existing);
   }
-
-  const blockedRuleMap = new Map();
-  for (const rule of allRules) {
-    const key = `${rule.webAcl}/${rule.name}`;
-    blockedRuleMap.set(key, Math.max(1, rule.blocks));
-  }
-
-  const attackTypes = Array.from(blockedRuleMap.entries())
-    .sort((a,b) => b[1] - a[1])
-    .slice(0, 10)
-    .map(([rule, requests]) => ({ type: rule, requests }));
 
   const managedRuleGroups = Array.from(ruleGroupMap.values()).map(group => ({
     name: group.name,
@@ -334,60 +336,101 @@ async function getWAFData(awsCreds) {
     webACLs: Array.from(group.webACLs),
   }));
 
+  // ── Fetch sampled requests — use WebACL-level metric for ALL traffic ───────
+  // This gives us real request counts, geo IPs, URIs, and terminating rules.
   const geoMap = new Map();
   const uriMap = new Map();
   const terminatedRuleMap = new Map();
+  let sampledAllow = 0, sampledBlock = 0, sampledCount = 0, sampledChallenge = 0, sampledCaptcha = 0;
 
-  // Fetch sampled requests for each WebACL to get GeoIP and URI data
+  // Use a 3-hour window to get enough samples (WAF sampling is ~1% of traffic)
+  const timeWindow = {
+    StartTime: new Date(Date.now() - 3 * 3600 * 1000),
+    EndTime: new Date(),
+  };
+
   for (const acl of webACLs) {
-    // Pick the correct client based on the ACL's scope
     const aclClient = acl.scope === "CLOUDFRONT" ? globalClient : regionalClient;
-    // We sample from the default action AND from each rule to get a full picture
-    const metricNames = [acl.defaultMetricName, ...(acl.rules || []).map(r => r.metricName)].filter(Boolean);
-    
-    for (const metricName of metricNames) {
+
+    // Sample using the WebACL-level metric — this captures ALL requests
+    const metricsToSample = [
+      acl.defaultMetricName,
+      ...acl.rules.map(r => r.metricName),
+    ].filter(Boolean);
+
+    // Deduplicate metric names
+    const uniqueMetrics = [...new Set(metricsToSample)];
+
+    for (const metricName of uniqueMetrics) {
       try {
-        const timeWindow = {
-          StartTime: new Date(Date.now() - 3600000), // Last 1 hour
-          EndTime: new Date(),
-        };
         const sampled = await aclClient.send(new GetSampledRequestsCommand({
           WebACLArn: acl.arn,
           RuleMetricName: metricName,
           Scope: acl.scope,
           TimeWindow: timeWindow,
-          MaxItems: 100,
+          MaxItems: 500,
         }));
 
         for (const req of sampled.SampledRequests || []) {
+          // ── Geo IP ──────────────────────────────────────────────────────────
           const country = req.Request?.Country || "Unknown";
-          const uri = req.Request?.URI || "/";
-          const termRule = req.TerminatingRuleId || "Default";
-
           geoMap.set(country, (geoMap.get(country) || 0) + 1);
+
+          // ── URI ─────────────────────────────────────────────────────────────
+          const uri = req.Request?.URI || "/";
           uriMap.set(uri, (uriMap.get(uri) || 0) + 1);
+
+          // ── Terminating rule (what actually stopped/allowed the request) ───
+          const termRule = req.TerminatingRuleId || "Default_Action";
           terminatedRuleMap.set(termRule, (terminatedRuleMap.get(termRule) || 0) + 1);
+
+          // ── Traffic action counters from real sampled data ──────────────────
+          const action = req.Action?.toUpperCase() || "";
+          if (action === "ALLOW")     sampledAllow++;
+          else if (action === "BLOCK") sampledBlock++;
+          else if (action === "COUNT") sampledCount++;
+          else if (action === "CAPTCHA_REQUEST_CUSTOMRESPONSE" || action === "CAPTCHA") sampledCaptcha++;
+          else if (action === "CHALLENGE") sampledChallenge++;
+          else sampledAllow++; // default pass-through
         }
       } catch (e) {
-        // Many rules might not have sampled requests available
+        // Silently skip — metric may have no traffic or insufficient permissions
       }
     }
   }
 
+  // ── If sampled data has traffic, use it; otherwise fall back to rule counts ─
+  const hasSampledTraffic = (sampledAllow + sampledBlock + sampledCount + sampledChallenge + sampledCaptcha) > 0;
+
+  const allow     = hasSampledTraffic ? sampledAllow     : webACLs.filter(a => a.defaultAction === "ALLOW").length;
+  const block     = hasSampledTraffic ? sampledBlock     : allRules.filter(r => r.action === "BLOCK").length;
+  const count     = hasSampledTraffic ? sampledCount     : allRules.filter(r => r.action === "COUNT").length;
+  const challenge = hasSampledTraffic ? sampledChallenge : allRules.filter(r => r.action === "CHALLENGE").length;
+  const captcha   = hasSampledTraffic ? sampledCaptcha   : allRules.filter(r => r.action === "CAPTCHA").length;
+
+  // ── Top Geo IPs ────────────────────────────────────────────────────────────
   const topGeoIPs = Array.from(geoMap.entries())
-    .sort((a,b) => b[1] - a[1])
+    .sort((a, b) => b[1] - a[1])
     .slice(0, 10)
     .map(([country, requests]) => ({ country, requests }));
 
+  // ── Top URIs ───────────────────────────────────────────────────────────────
   const topURIs = Array.from(uriMap.entries())
-    .sort((a,b) => b[1] - a[1])
+    .sort((a, b) => b[1] - a[1])
     .slice(0, 10)
     .map(([uri, requests]) => ({ uri, requests }));
 
+  // ── Terminated / Blocked rules (from real sampled data) ───────────────────
   const blockedRules = Array.from(terminatedRuleMap.entries())
-    .sort((a,b) => b[1] - a[1])
+    .sort((a, b) => b[1] - a[1])
     .slice(0, 10)
     .map(([rule, blocks]) => ({ rule, blocks }));
+
+  // ── Attack Types — use terminating rule names (clean, not webacl/rule path) ─
+  const attackTypes = blockedRules
+    .filter(r => r.rule !== "Default_Action")
+    .slice(0, 10)
+    .map(r => ({ type: r.rule, requests: r.blocks }));
 
   return {
     allow,
@@ -403,6 +446,7 @@ async function getWAFData(awsCreds) {
     blockedRules,
     attackTypes,
     managedRuleGroups,
+    sampledFromRealTraffic: hasSampledTraffic,
   };
 }
 

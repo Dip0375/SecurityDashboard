@@ -1918,11 +1918,11 @@ function WAFSection({ account }) {
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 12 }}>
-        <Stat label="Total Traffic" value={fmtNum(totalTraffic)} color={C.cyan} icon={Globe} />
+        <Stat label="Total Traffic" value={fmtNum(totalTraffic)} color={C.cyan} icon={Globe} sub={w.sampledFromRealTraffic ? "From sampled requests" : "From rule config"} />
         <Stat label="Allow" value={fmtNum(w.allow)} color={C.green} icon={CheckCircle} />
         <Stat label="Block" value={fmtNum(w.block)} color={C.red} icon={XCircle} />
         <Stat label="COUNT" value={fmtNum(w.count)} color={C.yellow} icon={Activity} />
-        <Stat label="Challenges" value={fmtNum(w.challenge)} color={C.orange} icon={AlertTriangle} />
+        <Stat label="Challenge" value={fmtNum(w.challenge)} color={C.orange} icon={AlertTriangle} />
         <Stat label="CAPTCHA" value={fmtNum(w.captcha)} color={C.purple} icon={Lock} />
       </div>
 
