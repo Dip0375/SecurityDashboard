@@ -1860,6 +1860,9 @@ function WAFSection({ account }) {
 
   const protectedResources = webACLs.reduce((sum, acl) => sum + (acl.attachedResources?.length || 0), 0);
   const totalTraffic = w.totalTraffic ?? (w.allow + w.block + w.count + w.challenge + w.captcha);
+  const activeRegions = w.activeRegions || [];
+  const regionalACLs  = webACLs.filter(a => a.scope === "REGIONAL");
+  const globalACLs    = webACLs.filter(a => a.scope === "CLOUDFRONT");
 
   const attackTypes = useMemo(() => {
     if (w.attackTypes?.length) return w.attackTypes;
@@ -1883,15 +1886,33 @@ function WAFSection({ account }) {
 
   const webACLOptions = webACLs.map((acl, idx) => ({
     value: idx,
-    label: `${acl.name} (${acl.scope}) — ${acl.attachedResources?.length ?? 0} resources`,
+    label: `${acl.name} (${acl.scope}${acl.region ? ` · ${acl.region}` : ""}) — ${acl.attachedResources?.length ?? 0} resources`,
   }));
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+
+      {/* Active regions summary */}
+      {(activeRegions.length > 0 || globalACLs.length > 0) && (
+        <div style={{ ...card2(), display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+          <span style={{ color: C.textSec, fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em" }}>WAF Coverage:</span>
+          {globalACLs.length > 0 && (
+            <span style={{ background: `${C.purple}20`, border: `1px solid ${C.purple}40`, borderRadius: 20, padding: "3px 10px", fontSize: 11, color: C.purple, fontWeight: 700 }}>
+              🌐 CloudFront (Global) · {globalACLs.length} ACL{globalACLs.length !== 1 ? "s" : ""}
+            </span>
+          )}
+          {activeRegions.filter(r => regionalACLs.some(a => a.region === r)).map(region => (
+            <span key={region} style={{ background: `${C.cyan}15`, border: `1px solid ${C.cyan}30`, borderRadius: 20, padding: "3px 10px", fontSize: 11, color: C.cyan, fontWeight: 600 }}>
+              {region} · {regionalACLs.filter(a => a.region === region).length} ACL{regionalACLs.filter(a => a.region === region).length !== 1 ? "s" : ""}
+            </span>
+          ))}
+          <span style={{ marginLeft: "auto", fontSize: 11, color: w.metricsSource === "CloudWatch" ? C.green : w.metricsSource === "SampledRequests" ? C.yellow : C.textMut, fontWeight: 600 }}>
+            {w.metricsSource === "CloudWatch" ? "✓ CloudWatch metrics" : w.metricsSource === "SampledRequests" ? "~ Sampled requests" : "⚠ Rule config only"}
+          </span>
+        </div>
+      )}
+
       <div style={card()}>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 18, justifyContent: "space-between", alignItems: "flex-start" }}>
-          <div style={{ minWidth: 260, flex: 1 }}>
-            <h3 style={{ color: C.textPri, fontSize: 14, fontWeight: 700, margin: "0 0 12px" }}>Available Web ACLs</h3>
             {webACLOptions.length === 0 ? (
               <p style={{ color: C.textSec, fontSize: 12, margin: 0 }}>No Web ACLs detected for this account.</p>
             ) : (
@@ -1918,7 +1939,7 @@ function WAFSection({ account }) {
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 12 }}>
-        <Stat label="Total Traffic" value={fmtNum(totalTraffic)} color={C.cyan} icon={Globe} sub={w.sampledFromRealTraffic ? "From sampled requests" : "From rule config"} />
+        <Stat label="Total Traffic" value={fmtNum(totalTraffic)} color={C.cyan} icon={Globe} sub={w.metricsSource === "CloudWatch" ? "CloudWatch (exact)" : w.sampledFromRealTraffic ? "Sampled requests" : "From rule config"} />
         <Stat label="Allow" value={fmtNum(w.allow)} color={C.green} icon={CheckCircle} />
         <Stat label="Block" value={fmtNum(w.block)} color={C.red} icon={XCircle} />
         <Stat label="COUNT" value={fmtNum(w.count)} color={C.yellow} icon={Activity} />
@@ -2968,7 +2989,7 @@ function AccountsSection({ accounts, setAccounts, addToast, logEvent }) {
 }
 
 // ─── Inventory Section ────────────────────────────────────────────────────────
-function InventorySection({ account, refreshSignal, onInventoryLoaded }) {
+function InventorySection({ account, refreshSignal, onInventoryLoaded, timeRange }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -2979,7 +3000,7 @@ function InventorySection({ account, refreshSignal, onInventoryLoaded }) {
     if (!account) return;
     setLoading(true); setError(null);
     try {
-      const inv = await fetchInventory(account.id, account.region);
+      const inv = await fetchInventory(account.id, account.region, timeRange);
       setData(inv);
       onInventoryLoaded?.(account.id, inv);
       setLastFetched(new Date());
@@ -2988,7 +3009,7 @@ function InventorySection({ account, refreshSignal, onInventoryLoaded }) {
     } finally {
       setLoading(false);
     }
-  }, [account.id, account.region]);
+  }, [account?.id, account?.region, timeRange]);
 
   useEffect(() => { load(); }, [load, refreshSignal]);
 

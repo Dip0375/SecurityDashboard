@@ -251,78 +251,134 @@ async function safeCall(label, fn, fallback) {
   }
 }
 
-// ─── Map AWS WAF rule action to a display action string ───────────────────────
+// ─── Map AWS WAF rule action to a display string ─────────────────────────────
 function resolveRuleAction(r) {
   if (r.Action?.Allow)     return "ALLOW";
   if (r.Action?.Block)     return "BLOCK";
   if (r.Action?.Count)     return "COUNT";
   if (r.Action?.Captcha)   return "CAPTCHA";
   if (r.Action?.Challenge) return "CHALLENGE";
-  // Rule group references and managed rules have no direct Action — they use OverrideAction
-  if (r.OverrideAction?.None || r.OverrideAction?.Count) return r.OverrideAction?.Count ? "COUNT" : "MANAGED";
+  // Managed rule groups use OverrideAction instead of Action
+  if (r.OverrideAction?.Count) return "COUNT";
+  if (r.OverrideAction?.None)  return "MANAGED";
   return "MANAGED";
 }
 
-async function getWAFData(awsCreds) {
-  const scopes = ["REGIONAL", "CLOUDFRONT"];
+// ─── All AWS regions where WAF Regional WebACLs can exist ────────────────────const WAF_REGIONAL_REGIONS = [
+  "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+  "ca-central-1", "ca-west-1",
+  "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-central-2",
+  "eu-north-1", "eu-south-1", "eu-south-2",
+  "ap-south-1", "ap-south-2",
+  "ap-southeast-1", "ap-southeast-2", "ap-southeast-3", "ap-southeast-4",
+  "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
+  "ap-east-1",
+  "me-south-1", "me-central-1",
+  "af-south-1",
+  "sa-east-1",
+  "il-central-1",
+];
+
+// ─── Scan one region for Regional WebACLs ────────────────────────────────────
+async function scanRegionForWebACLs(awsCreds, region) {
+  const client = new WAFV2Client({ ...awsCreds, region });
+  const webACLs = [];
+  try {
+    const res = await client.send(new ListWebACLsCommand({ Scope: "REGIONAL", Limit: 100 }));
+    for (const acl of res.WebACLs || []) {
+      let detail = null;
+      let attachedResources = [];
+      try {
+        const full = await client.send(new GetWebACLCommand({ Scope: "REGIONAL", Name: acl.Name, Id: acl.Id }));
+        detail = full.WebACL;
+      } catch (e) { /* skip detail */ }
+      try {
+        const r = await client.send(new ListResourcesForWebACLCommand({ WebACLArn: acl.ARN }));
+        attachedResources = r.ResourceArns || [];
+      } catch (e) { /* skip resources */ }
+
+      webACLs.push({
+        name: acl.Name,
+        id: acl.Id,
+        scope: "REGIONAL",
+        region,
+        arn: acl.ARN,
+        attachedResources,
+        defaultAction: detail?.DefaultAction?.Allow ? "ALLOW" : detail?.DefaultAction?.Block ? "BLOCK" : "UNKNOWN",
+        rules: (detail?.Rules || []).map(r => ({
+          name: r.Name,
+          priority: r.Priority,
+          action: resolveRuleAction(r),
+          ruleGroup: r.Statement?.RuleGroupReferenceStatement?.ARN?.split("/").pop()
+            || r.Statement?.ManagedRuleGroupStatement?.Name
+            || null,
+          metricName: r.VisibilityConfig?.MetricName || r.Name,
+        })),
+        defaultMetricName: detail?.VisibilityConfig?.MetricName || acl.Name,
+      });
+    }
+  } catch (e) {
+    // Region may not support WAF or credentials may not have access — skip silently
+  }
+  return webACLs;
+}
+
+async function getWAFData(awsCreds, timeRangeHours = 24) {
   const webACLs = [];
 
-  // Regional client (uses the selected region)
-  const regionalClient = new WAFV2Client(awsCreds);
-  // Global client (CloudFront WAF is always in us-east-1)
+  // ── 1. Scan CloudFront (GLOBAL) — always us-east-1 ───────────────────────
   const globalClient = new WAFV2Client({ ...awsCreds, region: "us-east-1" });
+  try {
+    const res = await globalClient.send(new ListWebACLsCommand({ Scope: "CLOUDFRONT", Limit: 100 }));
+    for (const acl of res.WebACLs || []) {
+      let detail = null;
+      try {
+        const full = await globalClient.send(new GetWebACLCommand({ Scope: "CLOUDFRONT", Name: acl.Name, Id: acl.Id }));
+        detail = full.WebACL;
+      } catch (e) { /* skip */ }
 
-  for (const scope of scopes) {
-    const client = scope === "CLOUDFRONT" ? globalClient : regionalClient;
-    try {
-      const res = await client.send(new ListWebACLsCommand({ Scope: scope, Limit: 100 }));
-      for (const acl of res.WebACLs || []) {
-        let detail = null;
-        let attachedResources = [];
-        try {
-          const full = await client.send(new GetWebACLCommand({ Scope: scope, Name: acl.Name, Id: acl.Id }));
-          detail = full.WebACL;
-        } catch (e) {
-          console.warn(`[aws-query] Could not get details for WAF ${acl.Name}:`, e.message);
-        }
-
-        if (scope === "REGIONAL") {
-          try {
-            const resources = await client.send(new ListResourcesForWebACLCommand({ WebACLArn: acl.ARN }));
-            attachedResources = resources.ResourceArns || [];
-          } catch (e) {
-            console.warn(`[aws-query] Could not list resources for WAF ${acl.Name}:`, e.message);
-          }
-        }
-
-        webACLs.push({
-          name: acl.Name,
-          id: acl.Id,
-          scope,
-          arn: acl.ARN,
-          attachedResources,
-          defaultAction: detail?.DefaultAction?.Allow ? "ALLOW" : detail?.DefaultAction?.Block ? "BLOCK" : "UNKNOWN",
-          rules: (detail?.Rules || []).map(r => ({
-            name: r.Name,
-            priority: r.Priority,
-            action: resolveRuleAction(r),
-            ruleGroup: r.Statement?.RuleGroupReferenceStatement?.ARN?.split("/").pop()
-              || r.Statement?.ManagedRuleGroupStatement?.Name
-              || null,
-            metricName: r.VisibilityConfig?.MetricName || r.Name,
-          })),
-          // The WebACL-level metric is the best source for ALL traffic sampling
-          defaultMetricName: detail?.VisibilityConfig?.MetricName || acl.Name,
-        });
-      }
-    } catch (e) {
-      console.warn(`[aws-query] WAF scope ${scope} failed:`, e.message);
+      webACLs.push({
+        name: acl.Name,
+        id: acl.Id,
+        scope: "CLOUDFRONT",
+        region: "us-east-1",
+        arn: acl.ARN,
+        attachedResources: [],   // CloudFront associations are on the distribution, not here
+        defaultAction: detail?.DefaultAction?.Allow ? "ALLOW" : detail?.DefaultAction?.Block ? "BLOCK" : "UNKNOWN",
+        rules: (detail?.Rules || []).map(r => ({
+          name: r.Name,
+          priority: r.Priority,
+          action: resolveRuleAction(r),
+          ruleGroup: r.Statement?.RuleGroupReferenceStatement?.ARN?.split("/").pop()
+            || r.Statement?.ManagedRuleGroupStatement?.Name
+            || null,
+          metricName: r.VisibilityConfig?.MetricName || r.Name,
+        })),
+        defaultMetricName: detail?.VisibilityConfig?.MetricName || acl.Name,
+      });
     }
+  } catch (e) {
+    console.warn("[aws-query] CloudFront WAF scan failed:", e.message);
   }
 
-  // ── Build rule group map for "Managed Rule Groups" panel ──────────────────
+  // ── 2. Scan ALL regions for Regional WebACLs in parallel ─────────────────
+  // Start with the account's primary region, then fan out to all others.
+  // We use a concurrency limit to avoid hitting API rate limits.
+  const primaryRegion = awsCreds.region;
+  const otherRegions  = WAF_REGIONAL_REGIONS.filter(r => r !== primaryRegion);
+  const allRegions    = [primaryRegion, ...otherRegions];
+
+  // Scan in batches of 6 to stay within WAF API rate limits
+  const BATCH = 6;
+  for (let i = 0; i < allRegions.length; i += BATCH) {
+    const batch = allRegions.slice(i, i + BATCH);
+    const results = await Promise.all(batch.map(r => scanRegionForWebACLs(awsCreds, r)));
+    results.forEach(acls => webACLs.push(...acls));
+  }
+
+  // ── 3. Build rule group map ───────────────────────────────────────────────
   const allRules = webACLs.flatMap(acl =>
-    acl.rules.map(rule => ({ ...rule, webAcl: acl.name, scope: acl.scope }))
+    acl.rules.map(rule => ({ ...rule, webAcl: acl.name, scope: acl.scope, region: acl.region }))
   );
 
   const ruleGroupMap = new Map();
@@ -333,137 +389,119 @@ async function getWAFData(awsCreds) {
     existing.webACLs.add(rule.webAcl);
     ruleGroupMap.set(rule.ruleGroup, existing);
   }
-
-  const managedRuleGroups = Array.from(ruleGroupMap.values()).map(group => ({
-    name: group.name,
-    ruleCount: group.ruleCount,
-    webACLs: Array.from(group.webACLs),
+  const managedRuleGroups = Array.from(ruleGroupMap.values()).map(g => ({
+    name: g.name, ruleCount: g.ruleCount, webACLs: Array.from(g.webACLs),
   }));
 
-  // ── Fetch sampled requests — use WebACL-level metric for ALL traffic ───────
-  // This gives us real request counts, geo IPs, URIs, and terminating rules.
+  // ── 4. CloudWatch metrics (exact match with AWS WAF console) ─────────────
+  let allow = 0, block = 0, count = 0, challenge = 0, captcha = 0;
+  let metricsSource = "RuleConfig";
+
+  try {
+    const cwMetrics = await getWAFCloudWatchMetrics(awsCreds, webACLs, timeRangeHours);
+    if (cwMetrics.totalTraffic > 0) {
+      allow = cwMetrics.allow; block = cwMetrics.block; count = cwMetrics.count;
+      challenge = cwMetrics.challenge; captcha = cwMetrics.captcha;
+      metricsSource = "CloudWatch";
+    }
+  } catch (e) {
+    console.warn("[aws-query] CloudWatch WAF metrics failed:", e.message);
+  }
+
+  // ── 5. Sampled requests for Geo IP, URIs, terminating rules ──────────────
   const geoMap = new Map();
   const uriMap = new Map();
   const terminatedRuleMap = new Map();
   let sampledAllow = 0, sampledBlock = 0, sampledCount = 0, sampledChallenge = 0, sampledCaptcha = 0;
 
-  // Use a 3-hour window to get enough samples (WAF sampling is ~1% of traffic)
+  const sampleHours = Math.min(timeRangeHours, 3);
   const timeWindow = {
-    StartTime: new Date(Date.now() - 3 * 3600 * 1000),
+    StartTime: new Date(Date.now() - sampleHours * 3600 * 1000),
     EndTime: new Date(),
   };
 
+  // Group ACLs by region so we reuse one client per region
+  const aclsByRegion = new Map();
   for (const acl of webACLs) {
-    const aclClient = acl.scope === "CLOUDFRONT" ? globalClient : regionalClient;
+    const key = acl.scope === "CLOUDFRONT" ? "us-east-1:CLOUDFRONT" : `${acl.region}:REGIONAL`;
+    if (!aclsByRegion.has(key)) aclsByRegion.set(key, { acls: [], region: acl.scope === "CLOUDFRONT" ? "us-east-1" : acl.region, scope: acl.scope });
+    aclsByRegion.get(key).acls.push(acl);
+  }
 
-    // Sample using the WebACL-level metric — this captures ALL requests
-    const metricsToSample = [
-      acl.defaultMetricName,
-      ...acl.rules.map(r => r.metricName),
-    ].filter(Boolean);
+  for (const { acls, region: aclRegion, scope } of aclsByRegion.values()) {
+    const samplingClient = new WAFV2Client({ ...awsCreds, region: aclRegion });
+    for (const acl of acls) {
+      const uniqueMetrics = [...new Set([acl.defaultMetricName, ...acl.rules.map(r => r.metricName)].filter(Boolean))];
+      for (const metricName of uniqueMetrics) {
+        try {
+          const sampled = await samplingClient.send(new GetSampledRequestsCommand({
+            WebACLArn: acl.arn,
+            RuleMetricName: metricName,
+            Scope: scope,
+            TimeWindow: timeWindow,
+            MaxItems: 500,
+          }));
+          for (const req of sampled.SampledRequests || []) {
+            const country  = req.Request?.Country || "Unknown";
+            const uri      = req.Request?.URI || "/";
+            const termRule = req.TerminatingRuleId || "Default_Action";
+            geoMap.set(country,  (geoMap.get(country)  || 0) + 1);
+            uriMap.set(uri,      (uriMap.get(uri)       || 0) + 1);
+            terminatedRuleMap.set(termRule, (terminatedRuleMap.get(termRule) || 0) + 1);
 
-    // Deduplicate metric names
-    const uniqueMetrics = [...new Set(metricsToSample)];
-
-    for (const metricName of uniqueMetrics) {
-      try {
-        const sampled = await aclClient.send(new GetSampledRequestsCommand({
-          WebACLArn: acl.arn,
-          RuleMetricName: metricName,
-          Scope: acl.scope,
-          TimeWindow: timeWindow,
-          MaxItems: 500,
-        }));
-
-        for (const req of sampled.SampledRequests || []) {
-          // ── Geo IP ──────────────────────────────────────────────────────────
-          const country = req.Request?.Country || "Unknown";
-          geoMap.set(country, (geoMap.get(country) || 0) + 1);
-
-          // ── URI ─────────────────────────────────────────────────────────────
-          const uri = req.Request?.URI || "/";
-          uriMap.set(uri, (uriMap.get(uri) || 0) + 1);
-
-          // ── Terminating rule (what actually stopped/allowed the request) ───
-          const termRule = req.TerminatingRuleId || "Default_Action";
-          terminatedRuleMap.set(termRule, (terminatedRuleMap.get(termRule) || 0) + 1);
-
-          // ── Traffic action counters from real sampled data ──────────────────
-          const action = req.Action?.toUpperCase() || "";
-          if (action === "ALLOW")     sampledAllow++;
-          else if (action === "BLOCK") sampledBlock++;
-          else if (action === "COUNT") sampledCount++;
-          else if (action === "CAPTCHA_REQUEST_CUSTOMRESPONSE" || action === "CAPTCHA") sampledCaptcha++;
-          else if (action === "CHALLENGE") sampledChallenge++;
-          else sampledAllow++; // default pass-through
-        }
-      } catch (e) {
-        // Silently skip — metric may have no traffic or insufficient permissions
+            const action = req.Action?.toUpperCase() || "";
+            if      (action === "ALLOW")     sampledAllow++;
+            else if (action === "BLOCK")     sampledBlock++;
+            else if (action === "COUNT")     sampledCount++;
+            else if (action === "CAPTCHA" || action === "CAPTCHA_REQUEST_CUSTOMRESPONSE") sampledCaptcha++;
+            else if (action === "CHALLENGE") sampledChallenge++;
+            else sampledAllow++;
+          }
+        } catch (e) { /* metric may have no traffic */ }
       }
     }
   }
 
-  // ── Try CloudWatch metrics first (for exact sync with AWS WAF console) ─────
-  let allow, block, count, challenge, captcha;
-  let usingCloudWatchMetrics = false;
-
-  try {
-    const cwMetrics = await getWAFCloudWatchMetrics(awsCreds, webACLs);
-    if (cwMetrics.totalTraffic > 0) {
-      allow = cwMetrics.allow;
-      block = cwMetrics.block;
-      count = cwMetrics.count;
-      challenge = cwMetrics.challenge;
-      captcha = cwMetrics.captcha;
-      usingCloudWatchMetrics = true;
-      console.log("[aws-query] Using exact CloudWatch metrics for WAF data");
+  // If CloudWatch gave no data, fall back to sampled requests
+  if (metricsSource === "RuleConfig") {
+    const hasSampled = (sampledAllow + sampledBlock + sampledCount + sampledChallenge + sampledCaptcha) > 0;
+    if (hasSampled) {
+      allow = sampledAllow; block = sampledBlock; count = sampledCount;
+      challenge = sampledChallenge; captcha = sampledCaptcha;
+      metricsSource = "SampledRequests";
+    } else {
+      // Last resort: count rules by action type
+      allow     = webACLs.filter(a => a.defaultAction === "ALLOW").length;
+      block     = allRules.filter(r => r.action === "BLOCK").length;
+      count     = allRules.filter(r => r.action === "COUNT").length;
+      challenge = allRules.filter(r => r.action === "CHALLENGE").length;
+      captcha   = allRules.filter(r => r.action === "CAPTCHA").length;
     }
-  } catch (e) {
-    console.warn("[aws-query] CloudWatch metrics fetch failed, falling back to sampled requests:", e.message);
   }
 
-  // ── If CloudWatch metrics unavailable, use sampled data ───────────────────
-  if (!usingCloudWatchMetrics) {
-    // If sampled data has traffic, use it; otherwise fall back to rule counts ─
-    const hasSampledTraffic = (sampledAllow + sampledBlock + sampledCount + sampledChallenge + sampledCaptcha) > 0;
-
-    allow     = hasSampledTraffic ? sampledAllow     : webACLs.filter(a => a.defaultAction === "ALLOW").length;
-    block     = hasSampledTraffic ? sampledBlock     : allRules.filter(r => r.action === "BLOCK").length;
-    count     = hasSampledTraffic ? sampledCount     : allRules.filter(r => r.action === "COUNT").length;
-    challenge = hasSampledTraffic ? sampledChallenge : allRules.filter(r => r.action === "CHALLENGE").length;
-    captcha   = hasSampledTraffic ? sampledCaptcha   : allRules.filter(r => r.action === "CAPTCHA").length;
-  }
-
-  // ── Top Geo IPs ────────────────────────────────────────────────────────────
+  // ── 6. Build output arrays ────────────────────────────────────────────────
   const topGeoIPs = Array.from(geoMap.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10)
+    .sort((a, b) => b[1] - a[1]).slice(0, 10)
     .map(([country, requests]) => ({ country, requests }));
 
-  // ── Top URIs ───────────────────────────────────────────────────────────────
   const topURIs = Array.from(uriMap.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10)
+    .sort((a, b) => b[1] - a[1]).slice(0, 10)
     .map(([uri, requests]) => ({ uri, requests }));
 
-  // ── Terminated / Blocked rules (from real sampled data) ───────────────────
   const blockedRules = Array.from(terminatedRuleMap.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10)
+    .sort((a, b) => b[1] - a[1]).slice(0, 10)
     .map(([rule, blocks]) => ({ rule, blocks }));
 
-  // ── Attack Types — use terminating rule names (clean, not webacl/rule path) ─
   const attackTypes = blockedRules
     .filter(r => r.rule !== "Default_Action")
     .slice(0, 10)
     .map(r => ({ type: r.rule, requests: r.blocks }));
 
+  // Regions that have at least one WebACL
+  const activeRegions = [...new Set(webACLs.map(a => a.region))].sort();
+
   return {
-    allow,
-    block,
-    count,
-    challenge,
-    captcha,
+    allow, block, count, challenge, captcha,
     totalTraffic: allow + block + count + challenge + captcha,
     configuredRules: allRules.length,
     webACLs,
@@ -472,73 +510,79 @@ async function getWAFData(awsCreds) {
     blockedRules,
     attackTypes,
     managedRuleGroups,
-    metricsSource: usingCloudWatchMetrics ? "CloudWatch" : "SampledRequests",
-    usingCloudWatchMetrics,
+    activeRegions,
+    metricsSource,
+    sampledFromRealTraffic: metricsSource !== "RuleConfig",
   };
 }
 
-// ─── Fetch WAF metrics from CloudWatch (for exact data sync) ──────────────────
-async function getWAFCloudWatchMetrics(awsCreds, webACLs) {
-  const cwClient = new CloudWatchClient(awsCreds);
-  
-  let totalAllow = 0;
-  let totalBlock = 0;
-  let totalCount = 0;
-  let totalChallenge = 0;
-  let totalCaptcha = 0;
+// ─── Fetch WAF metrics from CloudWatch (exact match with AWS WAF console) ─────
+async function getWAFCloudWatchMetrics(awsCreds, webACLs, timeRangeHours = 24) {
+  const endTime   = new Date();
+  const startTime = new Date(endTime.getTime() - timeRangeHours * 60 * 60 * 1000);
+  const period    = timeRangeHours <= 3 ? 300 : timeRangeHours <= 24 ? 3600 : 86400;
 
-  // Time window: Last 24 hours
-  const endTime = new Date();
-  const startTime = new Date(endTime.getTime() - 24 * 60 * 60 * 1000);
+  let totalAllow = 0, totalBlock = 0, totalCount = 0, totalChallenge = 0, totalCaptcha = 0;
 
+  // Group WebACLs by their CloudWatch region to reuse clients
+  const aclsByRegion = new Map();
   for (const acl of webACLs) {
-    const metricQueries = [
-      { name: 'AllowedRequests', stat: 'Sum' },
-      { name: 'BlockedRequests', stat: 'Sum' },
-      { name: 'CountedRequests', stat: 'Sum' },
-      { name: 'ChallengeRequests', stat: 'Sum' },
-      { name: 'CaptchaRequests', stat: 'Sum' },
-    ];
+    // CloudFront WAF metrics are always in us-east-1
+    const cwRegion = acl.scope === "CLOUDFRONT" ? "us-east-1" : acl.region;
+    if (!aclsByRegion.has(cwRegion)) aclsByRegion.set(cwRegion, []);
+    aclsByRegion.get(cwRegion).push(acl);
+  }
 
-    for (const metric of metricQueries) {
-      try {
-        const params = {
-          Namespace: 'AWS/WAFV2',
-          MetricName: metric.name,
-          Dimensions: [
-            { Name: 'WebACL', Value: acl.name },
-            { Name: 'Region', Value: acl.scope },
-            { Name: 'Rule', Value: 'ALL' },
-          ],
-          StartTime: startTime,
-          EndTime: endTime,
-          Period: 3600, // 1 hour
-          Statistics: [metric.stat],
-        };
+  for (const [cwRegion, acls] of aclsByRegion.entries()) {
+    const cwClient = new CloudWatchClient({ ...awsCreds, region: cwRegion });
 
-        const result = await cwClient.send(new GetMetricStatisticsCommand(params));
-        const dataPoints = result.Datapoints || [];
-        const sum = dataPoints.reduce((acc, dp) => acc + (dp.Sum || 0), 0);
+    for (const acl of acls) {
+      // CloudFront WAF uses "CloudFront" as the Region dimension value
+      const regionDimValue = acl.scope === "CLOUDFRONT" ? "CloudFront" : acl.region;
 
-        if (metric.name === 'AllowedRequests') totalAllow += sum;
-        else if (metric.name === 'BlockedRequests') totalBlock += sum;
-        else if (metric.name === 'CountedRequests') totalCount += sum;
-        else if (metric.name === 'ChallengeRequests') totalChallenge += sum;
-        else if (metric.name === 'CaptchaRequests') totalCaptcha += sum;
-      } catch (e) {
-        // Silently skip if metric doesn't exist
-        console.warn(`[aws-query] Could not fetch CloudWatch metric ${metric.name} for WAF ${acl.name}:`, e.message);
+      const metricNames = [
+        { name: "AllowedRequests",   key: "allow" },
+        { name: "BlockedRequests",   key: "block" },
+        { name: "CountedRequests",   key: "count" },
+        { name: "ChallengeRequests", key: "challenge" },
+        { name: "CaptchaRequests",   key: "captcha" },
+      ];
+
+      for (const { name: metricName, key } of metricNames) {
+        try {
+          const result = await cwClient.send(new GetMetricStatisticsCommand({
+            Namespace:  "AWS/WAFV2",
+            MetricName: metricName,
+            Dimensions: [
+              { Name: "WebACL", Value: acl.name },
+              { Name: "Region", Value: regionDimValue },
+              { Name: "Rule",   Value: "ALL" },
+            ],
+            StartTime:  startTime,
+            EndTime:    endTime,
+            Period:     period,
+            Statistics: ["Sum"],
+          }));
+          const sum = (result.Datapoints || []).reduce((acc, dp) => acc + (dp.Sum || 0), 0);
+          if (key === "allow")     totalAllow     += sum;
+          if (key === "block")     totalBlock     += sum;
+          if (key === "count")     totalCount     += sum;
+          if (key === "challenge") totalChallenge += sum;
+          if (key === "captcha")   totalCaptcha   += sum;
+        } catch (e) {
+          // Metric may not exist for this WebACL — skip silently
+        }
       }
     }
   }
 
   return {
-    allow: totalAllow,
-    block: totalBlock,
-    count: totalCount,
-    challenge: totalChallenge,
-    captcha: totalCaptcha,
-    totalTraffic: totalAllow + totalBlock + totalCount + totalChallenge + totalCaptcha,
+    allow:        Math.round(totalAllow),
+    block:        Math.round(totalBlock),
+    count:        Math.round(totalCount),
+    challenge:    Math.round(totalChallenge),
+    captcha:      Math.round(totalCaptcha),
+    totalTraffic: Math.round(totalAllow + totalBlock + totalCount + totalChallenge + totalCaptcha),
     isFromCloudWatch: true,
   };
 }
@@ -726,8 +770,21 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  const { accountId, region: requestedRegion, credential } = req.body || {};
+  const { accountId, region: requestedRegion, credential, timeRange } = req.body || {};
   if (!accountId) return res.status(400).json({ error: "accountId is required" });
+
+  // Convert timeRange to hours for CloudWatch queries
+  function timeRangeToHours(tr) {
+    if (!tr || tr.type === "relative") {
+      const map = { "1m": 1/60, "5m": 5/60, "10m": 10/60, "30m": 0.5, "1h": 1, "3h": 3, "6h": 6, "12h": 12, "24h": 24, "3d": 72, "7d": 168, "14d": 336, "30d": 720, "3mo": 2160, "6mo": 4320, "12mo": 8760 };
+      return map[tr?.value] || 24;
+    }
+    if (tr.type === "absolute") {
+      return Math.max(1, (new Date(tr.end) - new Date(tr.start)) / 3600000);
+    }
+    return 24;
+  }
+  const timeRangeHours = timeRangeToHours(timeRange);
 
   let creds;
   try {
@@ -771,7 +828,7 @@ export default async function handler(req, res) {
       safeCall("S3", () => getS3Inventory(s3Client, region), { total:0, public:0, private:0, buckets:[] }),
       safeCall("VPC", () => getVPCInventory(ec2Client), { total:0, vpcs:[] }),
       safeCall("ALB", () => getALBInventory(albClient), { total:0, loadBalancers:[] }),
-      safeCall("WAF", () => getWAFData(awsCreds), { allow:0, block:0, count:0, challenge:0, captcha:0, configuredRules:0, totalTraffic:0, webACLs:[], topGeoIPs:[], topURIs:[], blockedRules:[], attackTypes:[], managedRuleGroups:[] }),
+      safeCall("WAF", () => getWAFData(awsCreds, timeRangeHours), { allow:0, block:0, count:0, challenge:0, captcha:0, configuredRules:0, totalTraffic:0, webACLs:[], topGeoIPs:[], topURIs:[], blockedRules:[], attackTypes:[], managedRuleGroups:[] }),
       
       // Multi-region aggregation for security findings
       (async () => {

@@ -183,9 +183,10 @@ function buildMockInventory(accountId) {
 }
 
 // ─── Real API call (Vercel serverless route) ──────────────────────────────────
-async function fetchFromAPI(accountId, region, credential) {
+async function fetchFromAPI(accountId, region, credential, timeRange) {
   const body = { accountId, region, service: "inventory" };
   if (credential) body.credential = credential;
+  if (timeRange)  body.timeRange  = timeRange;
   const res = await fetch("/api/aws-query", {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
@@ -214,12 +215,11 @@ async function fetchFromAPI(accountId, region, credential) {
  * @param {string} region
  * @returns {Promise<InventoryData>}
  */
-export async function fetchInventory(accountId, region) {
+export async function fetchInventory(accountId, region, timeRange) {
   const credential = getCredential(accountId);
   if (MOCK && !credential) {
-    // Simulate network latency
     await new Promise((r) => setTimeout(r, 600 + Math.random() * 800));
     return buildMockInventory(accountId);
   }
-  return fetchFromAPI(accountId, region, credential || undefined);
+  return fetchFromAPI(accountId, region, credential || undefined, timeRange);
 }
